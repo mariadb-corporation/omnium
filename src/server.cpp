@@ -342,6 +342,20 @@ vector<string> install_db_argv(const Basedir& b, const string& datadir, const st
   for (auto& o : split_ws(mysafe_options(b))) if (starts_with(o, "--loose-innodb-buffer-pool-size-max")) argv.push_back(o);
   return argv;
 }
+// The options of a server option string that shape the datadir when it is made, so they have to reach the
+// template as well as the server: a server refuses a datadir made with another page size ("Data file
+// './ibdata1' uses page size 16384, but the innodb_page_size start-up parameter is 4096"). That is MYINIT.
+string myinit_from(const string& options) {
+  string out;
+  if (!kTakeFixes) return out;                                  // Linux has the same gap; it keeps its behaviour until it is decided
+  for (auto& o : split_ws(options)) {
+    string k = lower(o.substr(0, o.find('=')));
+    for (char& c : k) if (c == '_') c = '-';
+    if (k == "--innodb-page-size" || k == "--innodb-undo-tablespaces" || k == "--innodb-data-file-path" || k == "--lower-case-table-names")
+      out += (out.empty() ? "" : " ") + o;
+  }
+  return out;
+}
 string template_for(const Basedir& b, const string& myinit, const string& templates_root) {
   // the key carries the root: two roots hold two templates, and a root removed after use
   // (the matrix does that) must not hand its path to the next caller
@@ -433,7 +447,7 @@ void Instance::set_paths(const string& trial_root, const string& datadir_overrid
 vector<string> Instance::argv() const {
   vector<string> a = {bd->bin};
   for (auto& o : split_ws(mysafe_options(*bd))) a.push_back(o);
-  for (auto& o : extra) if (!o.empty()) a.push_back(o);
+  for (auto& o : extra) if (!o.empty()) a.push_back(bd->windows ? native_option(o) : o);
   a.push_back("--basedir=" + bd->path);
   a.push_back("--datadir=" + datadir);
   a.push_back("--tmpdir=" + tmpdir);
@@ -462,8 +476,17 @@ bool Instance::alive() {
   if (pid <= 0) return false;
   int st;
   pid_t r = waitpid(pid, &st, WNOHANG);
-  if (r == pid) { pid = -1; return false; }
+  if (r == pid) { pid = -1; if (!stopping) exit_status = st; return false; }
   return kill(pid, 0) == 0;
+}
+bool Instance::silent_death() const {
+  if (!bd || !bd->windows || stopping || exit_status == -1) return false;
+  if (WIFEXITED(exit_status) && WEXITSTATUS(exit_status) == 0) return false;      // a plain exit
+  return !has_dump();                                                              // a minidump says it crashed the ordinary way
+}
+string Instance::silent_death_uid() const {
+  int code = WIFEXITED(exit_status) ? WEXITSTATUS(exit_status) : 128 + WTERMSIG(exit_status);
+  return fmt("CRASH_NO_LOG|exit status %d", code);
 }
 bool Instance::start_fresh(const string& tpl, int timeout_s) {
   mkdirs(root); mkdirs(logdir);
@@ -481,6 +504,8 @@ bool Instance::start_fresh(const string& tpl, int timeout_s) {
 }
 bool Instance::start_only(int timeout_s) {
   start_failed = false;
+  stopping = false;
+  exit_status = -1;
   start_note.clear();
   // The server changes to its datadir at startup, so a core lands there. The trial worker moves
   // it to /data as soon as the server is gone.
@@ -536,6 +561,7 @@ bool Instance::wait_ready(int timeout_s) {
 }
 bool Instance::shutdown(int timeout_s, string* note) {
   if (pid <= 0) return true;
+  stopping = true;                                              // from here on its end is the one omnium asked for
   // a clean shutdown through the admin client, as the framework does, so shutdown asserts and
   // hangs show; SIGTERM would do the same but the client path is what today's runs exercise.
   // What the admin client says is kept: a refused shutdown reads the same as a hung one otherwise.
@@ -577,6 +603,7 @@ bool Instance::shutdown(int timeout_s, string* note) {
 }
 void Instance::kill_hard() {
   if (pid <= 0) return;
+  stopping = true;
   kill_group(pid, SIGKILL);
   wait_pid(pid, 10000);
   pid = -1;
@@ -640,3 +667,12 @@ string Instance::core_path() const {
   return best;
 }
 bool Instance::has_core() const { return !core_path().empty(); }
+// A Windows server writes no core: it prints its frames into the error log and leaves a minidump in the datadir.
+// That dump is what a core is to the trial, the matrix and the MTR replay: the server crashed.
+bool Instance::has_dump() const {
+  if (!bd || !bd->windows) return false;
+  std::error_code ec;
+  for (auto& e : fs::directory_iterator(datadir, ec))
+    if (ends_with(lower(e.path().filename().string()), ".dmp") && e.is_regular_file(ec)) return true;
+  return false;
+}

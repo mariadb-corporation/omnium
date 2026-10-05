@@ -215,7 +215,15 @@ string mount_point_of(const string& p) {
   }
   return cur;
 }
-string abs_path(const string& p) {
+string abs_path(const string& p_in) {
+  string p = p_in;
+#if defined(__MSYS__) || defined(__CYGWIN__)
+  // C:\x or C:/x is a Windows path and so absolute; std::filesystem here is POSIX and would put the working directory in front of it
+  if (p.size() > 2 && isalpha((unsigned char)p[0]) && p[1] == ':' && (p[2] == '\\' || p[2] == '/')) {
+    char buf[4096];
+    if (cygwin_conv_path(CCP_WIN_A_TO_POSIX | CCP_ABSOLUTE, p.c_str(), buf, sizeof buf) == 0) p = buf;
+  }
+#endif
   std::error_code ec;
   fs::path a = fs::absolute(p, ec);
   fs::path c = fs::weakly_canonical(a, ec);
@@ -232,6 +240,59 @@ string windows_home() {
   if (up && *up && cygwin_conv_path(CCP_WIN_A_TO_POSIX, up, buf, sizeof buf) == 0) return buf;
 #endif
   return {};
+}
+string private_exe_copy(const string& exe) {
+#if defined(__MSYS__) || defined(__CYGWIN__)
+  struct stat st;
+  if (exe.empty() || stat(exe.c_str(), &st) != 0) return {};
+  const string dir = "/tmp/omnium_exe";
+  mkdirs(dir);
+  string copy = dir + "/omnium-" + std::to_string((long long)st.st_size) + "-" + std::to_string((long long)st.st_mtime) + ".exe";
+  // the copies nothing runs any more go once they are a while old (opening a running exe for writing
+  // fails with EBUSY, so one that runs is never touched), and so does a half-made copy
+  std::error_code ec;
+  for (auto& e : fs::directory_iterator(dir, ec)) {
+    string p = e.path().string();
+    if (p == copy || now_s() - file_mtime(p) < 600) continue;
+    if (p.find(".tmp") != string::npos) { unlink(p.c_str()); continue; }
+    if (!ends_with(p, ".exe")) continue;
+    int fd = open(p.c_str(), O_WRONLY);
+    if (fd >= 0) { close(fd); unlink(p.c_str()); }
+  }
+  if (file_size(copy) == (int64_t)st.st_size) return copy;
+  string tmp = copy + ".tmp" + std::to_string((long)getpid());
+  if (!copy_file(exe, tmp)) { unlink(tmp.c_str()); return {}; }
+  chmod(tmp.c_str(), 0755);
+  // another process may have made the same copy meanwhile, and be running it: then its copy stays
+  bool ok = rename(tmp.c_str(), copy.c_str()) == 0 || file_size(copy) == (int64_t)st.st_size;
+  unlink(tmp.c_str());
+  return ok ? copy : string();
+#else
+  (void)exe;
+  return {};
+#endif
+}
+string native_path(const string& posix) {
+#if defined(__MSYS__) || defined(__CYGWIN__)
+  if (posix.empty() || posix[0] != '/') return {};
+  char buf[4096];
+  if (cygwin_conv_path(CCP_POSIX_TO_WIN_A | CCP_ABSOLUTE, posix.c_str(), buf, sizeof buf) != 0) return {};
+  string s = buf;
+  for (char& c : s) if (c == '\\') c = '/';                       // the native programs take forward slashes as well
+  return s;
+#else
+  (void)posix;
+  return {};
+#endif
+}
+string native_option(const string& opt) {
+  size_t eq = opt.find('=');
+  if (eq == string::npos) return opt;
+  string v = opt.substr(eq + 1), pre;
+  if (starts_with(v, "FILE:")) { pre = "FILE:"; v = v.substr(5); }
+  if (v.find(':') != string::npos) return opt;                    // a list of paths: the MSYS2 runtime converts those itself
+  string n = native_path(v);
+  return n.empty() ? opt : opt.substr(0, eq + 1) + pre + n;
 }
 string user_home() {
   string h = home_dir(), w = windows_home();
@@ -353,6 +414,75 @@ uint64_t ram_available_bytes() { uint64_t t, a; return meminfo(t, a) ? a * 1024 
 int cpu_threads() { long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (int)n : 1; }
 double load_average() { double l[1]; return getloadavg(l, 1) == 1 ? l[0] : 0; }
 
+// ---------------------------------------------------------------------------------------------
+// what a child needs, made before the fork (the rule is at ExecPlan in common.h)
+// ---------------------------------------------------------------------------------------------
+extern char** environ;
+static string find_in_path(const string& cmd, const char* path_env) {
+  string path = path_env && *path_env ? path_env : "/usr/bin:/bin";
+  for (size_t pos = 0; pos <= path.size();) {
+    size_t colon = path.find(':', pos);
+    string dir = path.substr(pos, colon == string::npos ? string::npos : colon - pos);
+    pos = colon == string::npos ? path.size() + 1 : colon + 1;
+    string cand = (dir.empty() ? string(".") : dir) + "/" + cmd;
+    struct stat st;
+    if (stat(cand.c_str(), &st) == 0 && S_ISREG(st.st_mode) && access(cand.c_str(), X_OK) == 0) return cand;
+  }
+  return cmd;                                                   // not found: the exec says so, and the child ends with 127
+}
+ExecPlan exec_plan(const vector<string>& argv, const vector<string>& env_add, const string& cwd, const string& log) {
+  ExecPlan p;
+  p.cwd = cwd;
+  p.log = log;
+  for (auto& a : argv) p.av.push_back(const_cast<char*>(a.c_str()));
+  p.av.push_back(nullptr);
+  const char* path_env = nullptr;
+  if (!env_add.empty()) {                                       // the environment as it is, with these KEY=VALUE set over it
+    p.own_env = true;
+    for (char** e = environ; e && *e; e++) {
+      bool replaced = false;
+      for (auto& a : env_add) {
+        size_t eq = a.find('=');
+        string key = a.substr(0, eq == string::npos ? a.size() : eq);
+        if (strncmp(*e, key.c_str(), key.size()) == 0 && (*e)[key.size()] == '=') { replaced = true; break; }
+      }
+      if (!replaced) p.envp.push_back(*e);
+    }
+    for (size_t i = 0; i < env_add.size(); i++) {
+      const string& a = env_add[i];
+      size_t eq = a.find('=');
+      if (eq == string::npos) continue;                         // a bare name only takes the variable out
+      bool later = false;                                       // a variable given twice has the last value, as putenv in turn would give
+      for (size_t j = i + 1; j < env_add.size(); j++) if (env_add[j].compare(0, eq + 1, a, 0, eq + 1) == 0) { later = true; break; }
+      if (later) continue;
+      p.envp.push_back(const_cast<char*>(a.c_str()));
+      if (starts_with(a, "PATH=")) path_env = a.c_str() + 5;
+    }
+    p.envp.push_back(nullptr);
+  }
+  if (!path_env) path_env = getenv("PATH");
+  p.path = argv[0].find('/') != string::npos ? argv[0] : find_in_path(argv[0], path_env);
+  return p;
+}
+void exec_plan_run(const ExecPlan& p) {
+  if (p.own_env) execve(p.path.c_str(), p.av.data(), p.envp.data());
+  else execv(p.path.c_str(), p.av.data());
+  _exit(127);
+}
+
+// the raw wait status of a child, in words
+string wait_status_text(int st) {
+  if (WIFEXITED(st)) return fmt("exit %d", WEXITSTATUS(st));
+  if (WIFSIGNALED(st)) {
+    int sg = WTERMSIG(st);
+    const char* nm = sg == SIGSEGV ? "SIGSEGV" : sg == SIGABRT ? "SIGABRT" : sg == SIGBUS ? "SIGBUS" : sg == SIGILL ? "SIGILL" :
+                     sg == SIGFPE ? "SIGFPE" : sg == SIGKILL ? "SIGKILL" : sg == SIGTERM ? "SIGTERM" : sg == SIGPIPE ? "SIGPIPE" :
+                     sg == SIGINT ? "SIGINT" : sg == SIGHUP ? "SIGHUP" : nullptr;
+    return nm ? fmt("killed by signal %d (%s)", sg, nm) : fmt("killed by signal %d", sg);
+  }
+  return fmt("status %d", st);
+}
+
 // fork+exec with stdout and stderr on one pipe, an optional deadline, an optional cwd and env
 CmdResult run_capture_in(const vector<string>& argv, const string& stdin_text, int timeout_s, const string& cwd,
                          const vector<string>& env_add) {
@@ -363,6 +493,9 @@ CmdResult run_capture_in(const vector<string>& argv, const string& stdin_text, i
   int pfd[2], ifd[2] = {-1, -1};
   if (pipe2(pfd, O_CLOEXEC) != 0) return r;
   if (pipe2(ifd, O_CLOEXEC) != 0) { close(pfd[0]); close(pfd[1]); return r; }
+#ifdef OMNIUM_FORK_PLAN
+  ExecPlan plan = exec_plan(argv, env_add, cwd);                // MSYS2: all the child needs, made here (see ExecPlan)
+#endif
   pid_t pid = fork();
   if (pid < 0) { close(pfd[0]); close(pfd[1]); close(ifd[0]); close(ifd[1]); return r; }
   if (pid == 0) {
@@ -374,6 +507,11 @@ CmdResult run_capture_in(const vector<string>& argv, const string& stdin_text, i
     dup2(ifd[0], 0);
     if (ifd[0] > 2) close(ifd[0]);
     for (int f = 0; f <= 2; f++) fcntl(f, F_SETFD, 0);          // a pipe end that already was 0, 1 or 2 kept its close-on-exec
+#ifdef OMNIUM_FORK_PLAN
+    if (!plan.cwd.empty() && chdir(plan.cwd.c_str()) != 0) _exit(126);
+    setpgid(0, 0);
+    exec_plan_run(plan);
+#else
     if (!cwd.empty() && chdir(cwd.c_str()) != 0) _exit(126);
     for (auto& e : env_add) putenv(strdup(e.c_str()));
     setpgid(0, 0);
@@ -383,6 +521,7 @@ CmdResult run_capture_in(const vector<string>& argv, const string& stdin_text, i
     if (argv[0].find('/') != string::npos) execv(av[0], av.data());
     else execvp(av[0], av.data());
     _exit(127);
+#endif
   }
   close(pfd[1]);
   // The input can be larger than the pipe buffer, so it is fed and the output drained in the one
@@ -430,6 +569,9 @@ CmdResult run_capture(const vector<string>& argv, int timeout_s, const string& c
   if (argv.empty()) return r;
   int pfd[2];
   if (pipe2(pfd, O_CLOEXEC) != 0) return r;                    // close-on-exec: see run_capture_in
+#ifdef OMNIUM_FORK_PLAN
+  ExecPlan plan = exec_plan(argv, env_add, cwd);                // MSYS2: all the child needs, made here (see ExecPlan)
+#endif
   pid_t pid = fork();
   if (pid < 0) { close(pfd[0]); close(pfd[1]); return r; }
   if (pid == 0) {
@@ -440,6 +582,11 @@ CmdResult run_capture(const vector<string>& argv, int timeout_s, const string& c
     int devnull = open("/dev/null", O_RDONLY);
     if (devnull >= 0) { dup2(devnull, 0); if (devnull > 2) close(devnull); }
     for (int f = 0; f <= 2; f++) fcntl(f, F_SETFD, 0);          // as in run_capture_in
+#ifdef OMNIUM_FORK_PLAN
+    if (!plan.cwd.empty() && chdir(plan.cwd.c_str()) != 0) _exit(126);
+    setpgid(0, 0);
+    exec_plan_run(plan);
+#else
     if (!cwd.empty() && chdir(cwd.c_str()) != 0) _exit(126);
     for (auto& e : env_add) putenv(strdup(e.c_str()));
     setpgid(0, 0);
@@ -449,6 +596,7 @@ CmdResult run_capture(const vector<string>& argv, int timeout_s, const string& c
     if (argv[0].find('/') != string::npos) execv(av[0], av.data());
     else execvp(av[0], av.data());
     _exit(127);
+#endif
   }
   close(pfd[1]);
   double deadline = timeout_s > 0 ? now_ms() + timeout_s * 1000.0 : 0;

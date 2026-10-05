@@ -108,6 +108,33 @@ static void st_util() {
     st_check(c > 0 && waitpid(c, &ws, 0) == c && WIFEXITED(ws) && WEXITSTATUS(ws) == 0, "a capture works when stdin and stdout were closed");
   }
   {
+    // A child forked from a thread has only that thread's stack under MSYS2, so what it takes from the
+    // caller's strings must be copied before the fork (ExecPlan): the directory, the log and the
+    // environment below are strings on THIS thread's stack, which the thread that forks does not have.
+    string dir = "/tmp", log = "/tmp/omnium_st_forklog_" + std::to_string(getpid());
+    CmdResult tr, te;
+    pid_t sp = -1;
+    std::thread th([&] {
+      tr = run_capture({"/bin/pwd"}, 10, dir);
+      te = run_capture({"/bin/sh", "-c", "echo $OMNIUM_ST_ENV"}, 10, dir, {"OMNIUM_ST_ENV=thread"});
+      sp = spawn_program({"/bin/sh", "-c", "echo $OMNIUM_ST_ENV; pwd"}, log, dir, true, {"OMNIUM_ST_ENV=spawned"});
+    });
+    th.join();
+    st_check(tr.rc == 0 && trim(tr.out) == dir, "run_capture from a thread: the child starts in its directory [" + trim(tr.out) + "]");
+    st_check(te.rc == 0 && trim(te.out) == "thread", "and gets its environment [" + trim(te.out) + "]");
+    int sst = sp > 0 ? wait_pid(sp, 10000) : -1;
+    st_check(sp > 0 && sst == 0 && read_file(log) == "spawned\n" + dir + "\n",
+             "spawn_program from a thread: the child gets its directory, its environment and its log [" + trim(read_file(log)) + "]");
+    unlink(log.c_str());
+    // a bare command is looked for on the PATH the child is given, and one that is not there ends with 127
+    CmdResult pr = run_capture({"sh", "-c", "echo hi"}, 10, "", {"PATH=/usr/bin:/bin"});
+    st_check(pr.rc == 0 && pr.out == "hi\n", "a bare command is found on the PATH it is given");
+    st_check(run_capture({"omnium_no_such_command_xyz"}, 10).rc == 127, "a command that is not there ends with 127");
+    st_eq(wait_status_text(3 << 8), "exit 3", "wait_status_text: an exit");
+    st_eq(wait_status_text(SIGSEGV), "killed by signal 11 (SIGSEGV)", "wait_status_text: a segmentation fault");
+    st_eq(wait_status_text(SIGKILL), "killed by signal 9 (SIGKILL)", "wait_status_text: a kill");
+  }
+  {
     // a gdb that is not on the PATH is named as such, not as its exit code; PATH changes here,
     // before any thread is started
     string path = getenv("PATH") ? getenv("PATH") : "";
@@ -301,6 +328,82 @@ static void st_kb() {
   st_check(kb_jira_urls("ASAN|heap-use-after-free|sql/x.cc|f1|f2|f3|f4").size() == 1, "jira urls san: frames only");
   auto u2 = kb_jira_urls("SIGSEGV|ut_dbg_assertion_failed|f2|f3|f4");
   st_check(u2.size() == 1 && u2[0].find("f2%5C%22%22%20and%20text%20~%20%22%5C%22f2") != string::npos, "jira urls generic first frame skipped");
+  // A Windows box has UIDs that GCC and gdb would have spelled otherwise, and Jira holds the GCC text: MSVC writes NULL as 0
+  // where GCC writes __null, and a template argument as 64 where gdb writes 64u. So a 0 that == or != compares gets one URL
+  // more, for the __null reading (the text with its 0 stays the URL before it), and the frames that have a template
+  // argument one more, by their words. A Linux box has one spelling: its URLs are what they were.
+  auto wu = kb_jira_urls("thd->free_list == 0|SIGABRT|MYSQLparse|parse_sql|mysql_parse|dispatch_command");
+  auto mu = kb_jira_urls("a == 0 && b != 0|SIGABRT|f1|f2|f3|f4");
+  auto tu = kb_jira_urls("SIGSEGV|Bitmap<64>::set_bit|sort_and_filter_keyuse|make_join_statistics|JOIN::optimize_inner");
+  if (kHostMsys2) {
+    st_check(wu.size() == 3 && wu[1].find("free_list%20%3D%3D%200%5C") != string::npos && wu[2].find("free_list%20%3D%3D%20__null%5C") != string::npos &&
+             wu[2].find("%20or%20") == string::npos, "jira urls: a 0 compared with == is also searched as __null");
+    // several 0s, and the UID cannot say which is a NULL: all of them, then each alone, in one URL
+    st_check(mu.size() == 3 && mu[2].find("a%20%3D%3D%20__null%20%26%26%20b%20!%3D%20__null") != string::npos &&
+             mu[2].find("a%20%3D%3D%20__null%20%26%26%20b%20!%3D%200") != string::npos && mu[2].find("a%20%3D%3D%200%20%26%26%20b%20!%3D%20__null") != string::npos &&
+             mu[2].find("%20or%20") != string::npos && mu[2].find("%20or%20", mu[2].find("%20or%20") + 1) != string::npos, "jira urls: several 0s are read as __null together and one by one");
+    st_check(tu.size() == 2 && tu[1].find("%5C%22Bitmap%5C%22") != string::npos && tu[1].find("%5C%22set_bit%5C%22") != string::npos &&
+             tu[1].find("%5C%22make_join_statistics%5C%22") != string::npos && tu[1].find("%3C") == string::npos && tu[1].find("%20and%20") != string::npos,
+             "jira urls: a frame with a template argument is also searched by its words");
+  } else {
+    st_check(wu.size() == 2 && mu.size() == 2 && tu.size() == 1, "jira urls: a Linux box gets the URLs it always got");
+  }
+  // no variant where a 0 is no pointer test, where __null is there already, or where the UID has no assertion text
+  st_check(kb_jira_urls("scale >= 0|SIGABRT|f1|f2|f3|f4").size() == 2 && kb_jira_urls("x == 0x10|SIGABRT|f1|f2|f3|f4").size() == 2 &&
+           kb_jira_urls("x % 2 == 10|SIGABRT|f1|f2|f3|f4").size() == 2 && kb_jira_urls("thd->free_list == __null|SIGABRT|f1|f2|f3|f4").size() == 2 &&
+           kb_jira_urls("SIGABRT|f1|f2|f3|f4").size() == 1, "jira urls: no __null reading where there is no 0 to read");
+  // The known-bugs match of a Windows box reads both sides in one spelling, so the UID of a Windows run finds the line GCC and gdb
+  // made, and the other way round: __null is 0, a template argument 64u is 64 and true is 1, "A, B" is "A,B", "> >" is ">>",
+  // "Item *" is "Item*" and __int64 is long. A real 0 stays a 0, and a UID is never rewritten. A Linux box has one spelling,
+  // so there the match stays as it was: none of these finds the other.
+  {
+    string kbn = fmt("/tmp/omnium_st_kbnull_%d", getpid()), save_kb = g_paths.known_bugs;
+    write_file(kbn, "##### CURRENT BUGS (Search key: Mac) #####\n"
+                    "thd->free_list == __null|SIGABRT|MYSQLparse|parse_sql|mysql_parse|dispatch_command   ## MDEV-22013\n"
+                    "\"invalid state\" == 0|SIGABRT|ha_innobase::external_lock|handler::ha_external_lock|lock_external|mysql_lock_tables   ## MDEV-15494\n"
+                    "open_tables == 0 && lock == 0 && m_reprepare_observer == __null|SIGABRT|THD::restore_backup_open_tables_state|a|b   ## MDEV-24154\n"
+                    "SIGSEGV|Bitmap<64u>::set_bit|sort_and_filter_keyuse|make_join_statistics|JOIN::optimize_inner   ## MDEV-24513\n"
+                    "SIGSEGV|row_search_mvcc<InnoDBPolicy<true, true> >|ha_innobase::index_read|handler::ha_index_read_map|join_read_key2   ## MDEV-41023\n"
+                    "error != DB_FOREIGN_DUPLICATE_KEY|SIGABRT|ha_innobase::delete_row|handler::ha_delete_row|TABLE::delete_row<false>|TABLE::delete_row   ## MDEV-38348\n"
+                    "SIGSEGV|Item_equal_iterator<List_iterator_fast, Item>::get_curr_field|Item_equal::contains|Item_field::find_item_equal|eliminate_item_equal   ## MDEV-38879\n"
+                    "n < m_size|SIGABRT|Bounds_checked_array<Item*>::operator[]|Item::split_sum_func2|Item_cond::split_sum_func|JOIN::prepare   ## MDEV-40560\n"
+                    "SIGSEGV|std::__atomic_base<long>::store|Atomic_relaxed<long>::store|Atomic_relaxed<long>::operator=|trx_t::commit_tables   ## MDEV-30941\n"
+                    "\n###### FIXED BUGS ######\n");
+    g_paths.known_bugs = kbn;
+    auto one = [](const KbMatch& m, const char* key) { return kb_verdict(m) == KbVerdict::Known && m.exact.size() == 1 && m.exact[0].find(key) != string::npos; };
+    // each UID is the other spelling of the line named: a Windows box finds it, a Linux box does not
+    struct { const char* uid; const char* key; } other[] = {
+      {"thd->free_list == 0|SIGABRT|MYSQLparse|parse_sql|mysql_parse|dispatch_command", "MDEV-22013"},
+      {"\"invalid state\" == __null|SIGABRT|ha_innobase::external_lock|handler::ha_external_lock|lock_external|mysql_lock_tables", "MDEV-15494"},
+      {"open_tables == 0 && lock == 0 && m_reprepare_observer == 0|SIGABRT|THD::restore_backup_open_tables_state|a|b", "MDEV-24154"},
+      {"SIGSEGV|Bitmap<64>::set_bit|sort_and_filter_keyuse|make_join_statistics|JOIN::optimize_inner", "MDEV-24513"},
+      {"SIGSEGV|row_search_mvcc<InnoDBPolicy<1,1> >|ha_innobase::index_read|handler::ha_index_read_map|join_read_key2", "MDEV-41023"},
+      {"SIGSEGV|row_search_mvcc<InnoDBPolicy<1,1>>|ha_innobase::index_read|handler::ha_index_read_map|join_read_key2", "MDEV-41023"},
+      {"error != DB_FOREIGN_DUPLICATE_KEY|SIGABRT|ha_innobase::delete_row|handler::ha_delete_row|TABLE::delete_row<0>|TABLE::delete_row", "MDEV-38348"},
+      {"SIGSEGV|Item_equal_iterator<List_iterator_fast,Item>::get_curr_field|Item_equal::contains|Item_field::find_item_equal|eliminate_item_equal", "MDEV-38879"},
+      {"n < m_size|SIGABRT|Bounds_checked_array<Item *>::operator[]|Item::split_sum_func2|Item_cond::split_sum_func|JOIN::prepare", "MDEV-40560"},
+      {"SIGSEGV|std::__atomic_base<__int64>::store|Atomic_relaxed<__int64>::store|Atomic_relaxed<__int64>::operator=|trx_t::commit_tables", "MDEV-30941"},
+    };
+    for (auto& o : other) {
+      KbMatch m = kb_search(o.uid);
+      st_check(kHostMsys2 ? one(m, o.key) : m.exact.empty(), string("kb_search: ") + (kHostMsys2 ? "finds " : "on a Linux box does not find ") + o.key + " by the other spelling " + o.uid);
+    }
+    // the spelling the line has finds it on every box
+    st_check(one(kb_search("thd->free_list == __null|SIGABRT|MYSQLparse|parse_sql|mysql_parse|dispatch_command"), "MDEV-22013"), "kb_search: the list's own spelling finds the line");
+    st_check(one(kb_search("SIGSEGV|Bitmap<64u>::set_bit|sort_and_filter_keyuse|make_join_statistics|JOIN::optimize_inner"), "MDEV-24513"), "kb_search: the list's own template spelling finds the line");
+    // a different assertion, number or template argument is no match on any box
+    for (const char* uid : {"thd->free_list != 0|SIGABRT|MYSQLparse|parse_sql|mysql_parse|dispatch_command", "thd->free_list == 10|SIGABRT|MYSQLparse|parse_sql|mysql_parse|dispatch_command",
+                            "SIGSEGV|Bitmap<65>::set_bit|sort_and_filter_keyuse|make_join_statistics|JOIN::optimize_inner",
+                            "error != DB_FOREIGN_DUPLICATE_KEY|SIGABRT|ha_innobase::delete_row|handler::ha_delete_row|TABLE::delete_row<1>|TABLE::delete_row",
+                            "SIGSEGV|std::__atomic_base<int>::store|Atomic_relaxed<int>::store|Atomic_relaxed<int>::operator=|trx_t::commit_tables"})
+      st_check(kb_search(uid).exact.empty(), string("kb_search: no match for ") + uid);
+    string kerr;
+    bool dup = !kb_add_to(kbn, "thd->free_list == 0|SIGABRT|MYSQLparse|parse_sql|mysql_parse|dispatch_command", "MDEV-1", &kerr);
+    st_check(kHostMsys2 ? dup && starts_with(kerr, "already listed") : !dup, "kb_add_to: the other spelling of a listed assertion is a duplicate on a Windows box only");
+    st_check(kb_add_to(kbn, "thd->free_list == 0|SIGABRT|MYSQLparse|parse_sql|mysql_parse|other_frame", "MDEV-2", &kerr), "kb_add_to: another frame is not a duplicate");
+    g_paths.known_bugs = save_kb;
+    unlink(kbn.c_str());
+  }
   string tmp = fmt("/tmp/omnium_st_kb_%d", getpid());
   write_file(tmp, "## header\n\n##### Filter dud #####\nSIGSEGV|old|a|b|c                ## SPECIAL-1\n\n"
                   "##### CURRENT BUGS (Search key: Mac) #####\nSIGSEGV|k1|k2|k3|k4      ## MDEV-100\nINNODB_ERROR|old error   ## MDEV-101\n\n"
@@ -2063,6 +2166,97 @@ static void st_portability() {
     st_eq(join(install_db_argv(win, "/c/tpl", "/c/tpl.tmp", "--innodb_page_size=4k --innodb_undo_tablespaces=3"), " "),
           "/c/test/W/bin/mariadb-install-db --datadir=/c/tpl --innodb-page-size=4k", "install_db_argv: the Windows tool takes the datadir and the page size only");
     st_eq(join(install_db_argv(win, "/c/tpl", "/c/tpl.tmp", ""), " "), "/c/test/W/bin/mariadb-install-db --datadir=/c/tpl", "install_db_argv: the Windows tool with no MYINIT");
+    // a testcase's page size reaches the template through MYINIT, and so do the other options that shape a datadir
+    if (kTakeFixes) {
+      st_eq(myinit_from("--log-bin --innodb_page_size=4k --sql_mode= --innodb-buffer-pool-size=5M"), "--innodb_page_size=4k", "myinit_from: the page size out of a header's options");
+      st_eq(myinit_from("--Innodb-Undo-Tablespaces=3 --lower_case_table_names=1 --log-bin"), "--Innodb-Undo-Tablespaces=3 --lower_case_table_names=1", "myinit_from: either spelling, any case");
+      st_eq(myinit_from("--log-bin --innodb_file_per_table=0"), "", "myinit_from: no init option, no MYINIT");
+    } else {
+      st_eq(myinit_from("--innodb_page_size=4k"), "", "myinit_from: Linux keeps its behaviour, no MYINIT from the options");
+    }
+  }
+  // the trial's backup and crash-recovery stages: a root turned away is no finding, and the prepare of an encrypted backup
+  // gets the key plugin the server ran with (--no-defaults leaves out the backup-my.cnf that has it)
+  {
+    st_check(root_turned_away("connect kept failing: 1045 Access denied for user 'root'@'localhost' (using password: NO)"), "root_turned_away: error 1045");
+    st_check(root_turned_away("connect kept failing: 1130 Host 'localhost' is not allowed to connect to this MariaDB server") == kTakeFixes, "root_turned_away: error 1130, where the fixes are taken");
+    st_check(!root_turned_away("[ERROR] Aborting in the error log: Plugin 'file_key_management' init function returned error"), "root_turned_away: a start that really failed is not a turned-away root");
+    st_check(backup_is_encrypted({"--log-bin", "--plugin_load_add=file_key_management", "--file-key-management-filename=/x/key.enc"}), "backup_is_encrypted: the key plugin loaded");
+    st_check(backup_is_encrypted({"--file_key_management_use_pbkdf2=11000"}), "backup_is_encrypted: a parameter of it alone");
+    st_check(!backup_is_encrypted({"--log-bin", "--plugin_load_add=other_plugin", "--innodb-encrypt-tables=1"}), "backup_is_encrypted: other plugins and options are not it");
+  }
+  // a Windows server's crash leaves a minidump in its datadir, which counts as the core of a Linux one; no other build has it
+  {
+    Basedir wb, lb;
+    basedir_parse_name("MD180826-mariadb-13.1.0-windows-x86_64-opt", wb);
+    basedir_parse_name("MD180826-mariadb-13.1.0-linux-x86_64-opt", lb);
+    Instance ins;
+    ins.bd = &wb;
+    ins.datadir = tmp + "/dumpdata";
+    mkdirs(ins.datadir);
+    st_check(!ins.has_dump(), "has_dump: no minidump, no crash");
+    write_file(ins.datadir + "/mariadbd.dmp", "MDMP");
+    st_check(ins.has_dump() && !ins.has_core(), "has_dump: a minidump of a Windows server, and it is no core");
+    ins.bd = &lb;
+    st_check(!ins.has_dump(), "has_dump: a Linux build never has one");
+    // a Windows release server that dies of a failed /GS check or a __fastfail leaves no banner and no dump, and Cygwin
+    // reports it as exit status 127: that is a crash, unless omnium stopped it, it exited cleanly, or it left a dump
+    Instance sd;
+    sd.bd = &wb;
+    sd.datadir = tmp + "/silentdata";
+    mkdirs(sd.datadir);
+    sd.exit_status = 127 << 8;
+    st_check(sd.silent_death() && sd.silent_death_uid() == "CRASH_NO_LOG|exit status 127", "silent_death: a server that ended on its own with status 127 [" + sd.silent_death_uid() + "]");
+    sd.exit_status = 11;                                         // killed by a signal
+    st_check(sd.silent_death() && sd.silent_death_uid() == "CRASH_NO_LOG|exit status 139", "and one that a signal ended");
+    sd.exit_status = 0;
+    st_check(!sd.silent_death(), "silent_death: a clean exit is no crash");
+    sd.exit_status = 127 << 8;
+    sd.stopping = true;
+    st_check(!sd.silent_death(), "silent_death: nor is the end omnium asked for");
+    sd.stopping = false;
+    write_file(sd.datadir + "/mariadbd.dmp", "MDMP");
+    st_check(!sd.silent_death(), "silent_death: nor one that left a minidump, which is the ordinary crash");
+    sd.bd = &lb;
+    st_check(!sd.silent_death(), "silent_death: and never a Linux build");
+  }
+  // the copy of the binary that a long-running verb starts from under MSYS2, where a replaced exe stops fork(): made once
+  // per exe, the same path the second time, and of the same size; nothing off MSYS2
+  {
+    string fake = tmp + "/fake_omnium.exe";
+    copy_file(kHostMsys2 ? "/bin/true.exe" : "/bin/true", fake);
+    string c1 = private_exe_copy(fake);
+    if (kHostMsys2) {
+      st_check(starts_with(c1, "/tmp/omnium_exe/omnium-") && ends_with(c1, ".exe") && file_size(c1) == file_size(fake), "private_exe_copy: a copy of the same size, in /tmp/omnium_exe [" + c1 + "]");
+      st_eq(private_exe_copy(fake), c1, "and the same copy the second time");
+      st_check(private_exe_copy(tmp + "/no_such_exe.exe").empty(), "and none for a file that is not there");
+      unlink(c1.c_str());
+    } else {
+      st_check(c1.empty(), "private_exe_copy: nothing off MSYS2");
+    }
+    unlink(fake.c_str());
+    // a Windows path given as an argument is absolute there, not a name under the working directory
+    if (kHostMsys2) {
+      st_eq(abs_path("C:/Windows"), "/c/Windows", "abs_path: C:/x is the drive's path");
+      st_eq(abs_path("C:\\Windows"), "/c/Windows", "abs_path: so is C:\\x");
+    }
+  }
+  // a server option with a path, for a native Windows server: FILE:/path is converted here, as the MSYS2 runtime
+  // only converts a plain --opt=/path, and a value with no path stays as it is
+  {
+    string n = native_option("--file-key-management-filekey=FILE:/dev/shm/O1/9/key.pass");
+    if (kHostMsys2) {
+      st_check(starts_with(n, "--file-key-management-filekey=FILE:") && n.find("FILE:/") == string::npos && ends_with(n, "/dev/shm/O1/9/key.pass") && n.find('\\') == string::npos,
+               "native_option: the path after FILE: is native [" + n + "]");
+      string p = native_option("--file-key-management-filename=/dev/shm/O1/9/key.enc");
+      st_check(starts_with(p, "--file-key-management-filename=") && p.find("=/dev") == string::npos && ends_with(p, "/dev/shm/O1/9/key.enc"), "and so is a plain path [" + p + "]");
+    } else {
+      st_eq(n, "--file-key-management-filekey=FILE:/dev/shm/O1/9/key.pass", "native_option: off MSYS2 the option stays as it is");
+    }
+    st_eq(native_option("--sql_mode="), "--sql_mode=", "native_option: an empty value stays");
+    st_eq(native_option("--log-bin"), "--log-bin", "and an option with no value");
+    st_eq(native_option("--innodb_page_size=4k"), "--innodb_page_size=4k", "and a value that is no path");
+    st_eq(native_option("--plugin-dir=/a/b:/c/d"), "--plugin-dir=/a/b:/c/d", "and a list of paths, which the runtime converts itself");
   }
   // the optimizer trace cap only where the server has an optimizer trace
   {
@@ -2152,6 +2346,10 @@ static void st_portability() {
     st_check(tui_frame_lines(24, 100, 6, 30, 20, 20, 8) <= 23, "tui: a run with 30 slots and a long inbox fits 24 rows");
     st_check(tui_frame_lines(20, 80, 6, 30, 20, 20, 8) <= 19, "tui: and 20 rows, where the log tail gives way");
     st_check(tui_frame_lines(60, 120, 6, 30, 20, 20, 8) > 40, "tui: a tall terminal shows more of the lists");
+    // the log takes what the lists leave, so a frame fills the screen to the last line but one
+    for (int rows : {24, 30, 40, 60, 100})
+      st_check(tui_frame_lines(rows, 120, 2, 3, 0, 0, 8) == rows - 1,
+               fmt("tui: the log fills what the lists leave of a %d-row terminal", rows));
   }
   // a settings file from before a key was added, under a home of its own
   {
@@ -2167,6 +2365,41 @@ static void st_portability() {
     write_file(p, config_dump());
     st_check(config_missing_keys().empty(), "config_missing_keys: a full dump has them all");
     setenv("HOME", keep.c_str(), 1);
+  }
+  // TEST_DIR is where the builds are: /test on Linux, and C:\test as /c/test under MSYS2, whose own
+  // /test is C:\msys64\test and holds none. A TEST_DIR with no build says so, and one with a build
+  // says nothing.
+  {
+    st_eq(Config().test_dir, kHostMsys2 ? "/c/test" : "/test", "the build dir defaults to where this box keeps its builds");
+    string save = g_cfg.test_dir, td = tmp + "/notd";
+    mkdirs(td);
+    g_cfg.test_dir = td;
+    if (kTakeFixes) st_check(starts_with(test_dir_empty_note(), "no build under TEST_DIR " + td), "test_dir_empty_note: a TEST_DIR with no build says so");
+    else st_check(test_dir_empty_note().empty(), "test_dir_empty_note: says nothing off MSYS2");
+    string bd = td + "/MD180826-mariadb-13.1.0-linux-x86_64-opt";
+    mkdirs(bd + "/bin");
+    write_file(bd + "/bin/mariadbd", "#!/bin/sh\nexit 0\n");
+    chmod((bd + "/bin/mariadbd").c_str(), 0755);
+    st_check(test_dir_empty_note().empty(), "and one with a build says nothing");
+    // a registered Windows build with no mariadb-test is named (omnium mtr cannot run on it); one with it, and a Linux build, are not
+    {
+      string wo = "MD180826-mariadb-13.1.0-windows-x86_64-opt", wd = "MD180826-mariadb-13.1.0-windows-x86_64-dbg";
+      mkdirs(td + "/" + wo + "/bin");
+      mkdirs(td + "/" + wd + "/mariadb-test");
+      Registry rr;
+      for (const string& n : {wo, wd, string("MD180826-mariadb-13.1.0-linux-x86_64-opt")}) { BuildEntry e; e.name = n; rr.entries.push_back(e); }
+      vector<string> miss = windows_builds_without_mtr(rr);
+      st_check(miss.size() == 1 && miss[0] == wo, "windows_builds_without_mtr: the Windows build with no mariadb-test, and no other [" + join(miss, " ") + "]");
+      st_check(mtr_suite_fix().find("INSTALL_MYSQLTESTDIR=mariadb-test") != string::npos, "and the fix names the flag");
+    }
+    // a PERL setting that names no perl is refused with its name in the answer, and never falls back to another
+    {
+      string save_perl = g_cfg.perl, why;
+      g_cfg.perl = "/nonexistent/omnium_perl.exe";
+      st_check(native_perl_find(&why).empty() && why.find("PERL=/nonexistent/omnium_perl.exe is not there") != string::npos, "native_perl_find: a PERL that is not there says so [" + why + "]");
+      g_cfg.perl = save_perl;
+    }
+    g_cfg.test_dir = save;
   }
   // the mount point of a path: a parent on the same device, never one on another
   {
@@ -2313,7 +2546,9 @@ int cmd_selftest(const Args& a) {
 // One error log per detection class, with the UniqueID the mariadb-qa chain gives for it. Every one
 // of these was compared against new_text_string.sh and matched; the deep run repeats that check.
 namespace {
-struct UidFixture { const char* name; const char* log; const char* uid; };
+// windows: the log is a Windows server's, which the mariadb-qa scripts have no rule for, so the deep
+// run has no shell answer to compare it with and leaves it out
+struct UidFixture { const char* name; const char* log; const char* uid; bool windows = false; };
 const char* FX_HEAD = "2026-09-05  5:00:00 0 [Note] /test/13.1/bin/mariadbd (server 13.1.0-MariaDB-debug) starting as process 1 ...\n";
 const UidFixture UID_FIXTURES[] = {
   {"asan_poison",
@@ -2514,6 +2749,95 @@ const UidFixture UID_FIXTURES[] = {
   {"ps_version",
       "mariadbd: /test/13.1/sql/dd/impl/dictionary_impl.cc:100: virtual uint dd::Dictionary_impl::get_actual_P_S_version(THD*): Assertion `!error' failed.\n",
    "ASSERT|!error"},
+  // A Windows server's log. Its binary is mariadbd.exe, so a line a Linux log writes with "mariadbd:" reads
+  // "mariadbd.exe:", and the UID has to come out as the Linux twin's, with no .exe in it
+  {"win_crashed",
+      "2026-10-05 15:06:56 4 [ERROR] mariadbd.exe: Table 't1' is marked as crashed and should be repaired\n",
+   "MARKED_AS_CRASHED|Table X is marked as crashed and should be repaired", true},
+  {"win_mysqld_crashed",
+      "2026-10-05 15:06:56 4 [ERROR] mysqld.exe: Table 't1' is marked as crashed and should be repaired\n",
+   "MARKED_AS_CRASHED|Table X is marked as crashed and should be repaired", true},
+  {"win_mariadbd_error",
+      "2026-10-05 15:06:56 4 [ERROR] mariadbd.exe: Table 't1' has a corrupted index\r\n",
+   "MARIADBD_ERROR|mariadbd: Table table has a corrupted index", true},
+  // a mysql.* table that is corrupted on purpose: known as SPECIAL-47, and in the Linux list as this UID
+  {"win_cannot_load",
+      "2026-10-05 15:26:39 7 [ERROR] mariadbd.exe: Cannot load from mysql.procs_priv. The table is probably corrupted\n",
+   "MARIADBD_ERROR|mariadbd: Cannot load from mysql.procs_priv. The table is probably corrupted", true},
+  // A failed assert, as the Windows CRT prints it: MSVC writes NULL as 0 where GCC writes __null, and the UID keeps
+  // the 0 as printed. The walk starts at the handler and the abort route is left out; the first four frames remain
+  {"win_assert_zero",
+      "Assertion failed: thd->free_list == 0, file C:/test/13.1/sql/sql_yacc.yy, line 3756\n"
+      "260912 10:00:07 [ERROR] C:\\test\\MD120926-mariadb-13.1.1-windows-x86_64-dbg\\bin\\mariadbd.exe got exception 0x80000003 ;\n"
+      "Sorry, we probably made a mistake, and this is a bug.\n\n"
+      "Attempting backtrace. Include this in the bug report.\n"
+      "(note: Retrieving this information may fail)\n\n"
+      "Thread pointer: 0x1f2e3d4c\n"
+      "server.dll!my_sigabrt_handler()[my_thr_init.c:449]\n"
+      "ucrtbased.dll!raise()\n"
+      "ucrtbased.dll!abort()\n"
+      "ucrtbased.dll!_wassert()\n"
+      "server.dll!MYSQLparse()[sql_yacc.yy:3756]\n"
+      "server.dll!parse_sql()[sql_parse.cc:10100]\n"
+      "server.dll!mysql_parse()[sql_parse.cc:7800]\n"
+      "server.dll!dispatch_command()[sql_parse.cc:1900]\n"
+      "server.dll!do_command()[sql_parse.cc:1400]\n"
+      "KERNEL32.DLL!BaseThreadInitThunk()\n"
+      "ntdll.dll!RtlUserThreadStart()\n",
+   "thd->free_list == 0|SIGABRT|MYSQLparse|parse_sql|mysql_parse|dispatch_command", true},
+  // MSVC's deleting destructor, THD::`scalar deleting destructor', is gdb's second THD::~THD frame; this is the UID the list
+  // holds for MDEV-25972 (the thread pool frames below it are Linux's too, with --thread-handling=pool-of-threads)
+  {"win_deleting_destructor",
+      "Assertion failed: status_var.local_memory_used == 0 || !debug_assert_on_not_freed_memory, file C:/test/13.1/sql/sql_class.cc, line 1706\n"
+      "260912 10:00:07 [ERROR] C:\\test\\MD120926-mariadb-13.1.1-windows-x86_64-dbg\\bin\\mariadbd.exe got exception 0x80000003 ;\n"
+      "Attempting backtrace. Include this in the bug report.\n\n"
+      "server.dll!my_sigabrt_handler()[my_thr_init.c:449]\n"
+      "ucrtbased.dll!raise()\n"
+      "ucrtbased.dll!abort()\n"
+      "ucrtbased.dll!_wassert()\n"
+      "server.dll!THD::~THD()[sql_class.cc:1706]\n"
+      "server.dll!THD::`scalar deleting destructor'()\n"
+      "server.dll!threadpool_remove_connection()[threadpool_common.cc:210]\n"
+      "server.dll!tp_callback()[threadpool_common.cc:252]\n"
+      "server.dll!tp_callback()[threadpool_win.cc:279]\n"
+      "server.dll!io_completion_callback()[threadpool_win.cc:300]\n"
+      "ntdll.dll!RtlUserThreadStart()\n",
+   "status_var.local_memory_used == 0 || !debug_assert_on_not_freed_memory|SIGABRT|THD::~THD|THD::~THD|threadpool_remove_connection|tp_callback", true},
+  // a /RTC1 run-time check that failed (a stack variable overwritten, as in MDEV-37154): the abort route of the check, failwithmessage and
+  // _RTC_*, is no more a frame than abort() is, and the check that failed stands where an assertion's text does. This is the
+  // server's own log of that bug, CRLF line ends included
+  {"win_rtc_stack",
+      "261005 15:45:57 [ERROR] C:\\test\\MD120926-mariadb-13.1.1-windows-x86_64-dbg\\bin\\mariadbd.exe got exception 0x80000003 ;\r\n"
+      "Sorry, we probably made a mistake, and this is a bug.\r\n\r\n"
+      "Attempting backtrace. Include this in the bug report.\r\n"
+      "(note: Retrieving this information may fail)\r\n\r\n"
+      "Thread pointer: 0x1ffe5755c30\r\n"
+      "ha_archive.dll!failwithmessage()[error.cpp:210]\r\n"
+      "ha_archive.dll!_RTC_StackFailure()[error.cpp:263]\r\n"
+      "ha_archive.dll!_RTC_CheckStackVars()[stack.cpp:69]\r\n"
+      "ha_archive.dll!archive_discover()[ha_archive.cc:311]\r\n"
+      "server.dll!discover_handlerton()[handler.cc:7028]\r\n"
+      "server.dll!plugin_foreach_with_mask()[sql_plugin.cc:2584]\r\n"
+      "server.dll!ha_discover_table()[handler.cc:7072]\r\n"
+      "server.dll!open_table_def()[table.cc:696]\r\n"
+      "server.dll!do_command()[sql_parse.cc:1437]\r\n"
+      "server.dll!threadpool_process_request()[threadpool_common.cc:438]\r\n"
+      "ntdll.dll!RtlUserThreadStart()\r\n"
+      "\r\n"
+      "Connection ID (thread ID): 6\r\n",
+   "_RTC_StackFailure|SIGABRT|archive_discover|discover_handlerton|plugin_foreach_with_mask|ha_discover_table", true},
+  // the standard library's atomic storage, std::_Atomic_storage<T,N> to MSVC, is std::__atomic_base<T> to libstdc++ (the frame an
+  // atomic load fails in), and an anonymous namespace is `anonymous namespace' to MSVC and (anonymous namespace) to gdb
+  {"win_atomic_frames",
+      "260912 10:00:07 [ERROR] C:\\test\\MD120926-mariadb-13.1.1-windows-x86_64-dbg\\bin\\mariadbd.exe got exception 0xc0000005 ;\n"
+      "Attempting backtrace. Include this in the bug report.\n\n"
+      "server.dll!std::_Atomic_storage<unsigned int,4>::load()[atomic:1203]\n"
+      "server.dll!Atomic_relaxed<unsigned int>::operator unsigned int()[my_atomic_wrapper.h:60]\n"
+      "server.dll!`anonymous namespace'::helper()[buf0buf.cc:99]\n"
+      "server.dll!buf_page_t::state()[buf0buf.h:700]\n"
+      "server.dll!buf_page_t::in_file()[buf0buf.h:710]\n"
+      "ntdll.dll!RtlUserThreadStart()\n",
+   "SIGSEGV|std::__atomic_base<unsigned int>::load|Atomic_relaxed<unsigned int>::operator unsigned int|(anonymous namespace)::helper|buf_page_t::state", true},
 };
 string fixture_dir(const string& root, const UidFixture& f) {
   string d = root + "/" + f.name;
@@ -2563,10 +2887,16 @@ const FbFixture FALLBACK_FIXTURES[] = {
       "2026-09-05  5:00:05 0x7f0a InnoDB: Assertion failure: page0zip.cc:1234:0\n"
       "InnoDB: We intentionally generate a memory trap.\n",
    "FALLBACK|page0zip.cc.1234.0"},
+  // the same older wording from a Windows server, whose path has a drive: the script's main pipeline leaves the colon of
+  // C:\ alone (its dots are for the quotes, brackets and the like), and so does the port; the CRLF line ends stay out of the UID
+  {"innodb_in_file_windows",
+      "2026-10-05 15:30:00 0 [ERROR] InnoDB: Assertion failure in file C:\\test\\13.1\\storage\\innobase\\fts\\fts0fts.cc line 2108\r\n"
+      "InnoDB: Failing assertion: result != FTS_INVALID\r\n",
+   "FALLBACK|C:\\test\\13.1\\storage\\innobase\\fts\\fts0fts.cc line 2108"},
 };
 // One log per rule of the error-log scan, so every typed prefix and every severity tier is walked.
 // The UID is what error_log_scan.sh top gives; the deep run compares the two.
-struct ElsFixture { const char* name; const char* log; const char* uid; };
+struct ElsFixture { const char* name; const char* log; const char* uid; bool windows = false; };   // windows: as UidFixture
 const ElsFixture ELS_FIXTURES[] = {
   {"els_assert",
       "mariadbd: /test/13.1/sql/item_func.cc:1234: void Item_func_x::fix(): Assertion `page not corrupted' failed.\n",
@@ -2610,6 +2940,18 @@ const ElsFixture ELS_FIXTURES[] = {
   {"els_wsrep_warning",
       "2026-09-05  5:00:01 0 [Warning] WSREP: the node fell behind and is corrupted\n",
    "WSREP_WARNING|the node fell behind and is corrupted"},
+  // a Windows server's lines: mariadbd.exe: where a Linux log has mariadbd:. The scan, the filter and the
+  // typed prefixes are written against the Linux line, so each of these has to come out as its twin does
+  {"els_win_marked_crashed",
+      "2026-10-05 15:06:56 4 [ERROR] mariadbd.exe: Table 't1' is marked as crashed and should be repaired\n",
+   "MARKED_AS_CRASHED|Table X is marked as crashed and should be repaired", true},
+  {"els_win_typed",
+      "2026-10-05 15:06:56 4 [ERROR] mariadbd.exe: Table 't1' has a corrupted index\r\n",
+   "MARIADBD_ERROR|Table X has a corrupted index", true},
+  // the filter lists "mariadbd: Cannot load from mysql\..*The table is probably corrupted", so this line is dropped
+  {"els_win_filtered",
+      "2026-10-05 15:26:39 7 [ERROR] mariadbd.exe: Cannot load from mysql.user. The table is probably corrupted\n",
+   "", true},
 };
 static string els_fixture_log(const string& root, const ElsFixture& f) {
   string d = root + "/" + f.name;
@@ -2624,7 +2966,15 @@ static string fb_fixture_dir(const string& root, const FbFixture& f) {
   write_file(d + "/log/master.err", string(FX_HEAD) + f.log);
   return d;
 }
+// The path scrub reads the build root off TEST_DIR, and the fixtures below are Linux logs that name
+// /test/13.1/..., so they run with TEST_DIR=/test whatever the box has: under MSYS2 it is /c/test.
+struct TestDirPin {
+  string saved;
+  explicit TestDirPin(const string& d) : saved(g_cfg.test_dir) { g_cfg.test_dir = d; }
+  ~TestDirPin() { g_cfg.test_dir = saved; }
+};
 static void st_detect_classes() {
+  TestDirPin pin("/test");
   string tmp = st_tmp() + "/classes";
   for (auto& f : UID_FIXTURES) {
     string d = fixture_dir(tmp, f);
@@ -2644,6 +2994,14 @@ static void st_detect_classes() {
     string out;
     els_run("top", {els_fixture_log(tmp, f)}, false, out, nullptr);
     st_eq(trim(out), f.uid, string("the error-log scan types a ") + f.name + " line");
+  }
+  // s/mariadbd.exe/mariadbd/ is done as the lines are read, so every rule sees a Windows line as its Linux twin, the
+  // cleaned text included: both come out the same
+  for (auto& f : ELS_FIXTURES) {
+    string name = f.name, out;
+    if (name != "els_win_marked_crashed" && name != "els_marked_crashed") continue;
+    els_run("clean", {els_fixture_log(tmp, f)}, false, out, nullptr);
+    st_eq(trim(out), "ERROR. mariadbd: Table .* is marked as crashed and should be repaired", "els clean on a " + name + " line");
   }
   // the verbs that print a UID, on the sanitizer fixture: that path has no wait for a core
   string sd = tmp + "/asan_uaf";
@@ -2674,6 +3032,7 @@ static void st_detect_parity() {
   string script = script_path("new_text_string.sh");
   if (!file_exists(script)) return;
   for (auto& f : UID_FIXTURES) {
+    if (f.windows) continue;
     string d = fixture_dir(tmp, f);
     CmdResult c = run_capture({script}, 600, d);
     string shell_uid = c.out.empty() ? "" : trim(split_lines(c.out)[0]);
@@ -2683,6 +3042,7 @@ static void st_detect_parity() {
     string els = script_path("error_log_scan.sh");
     if (file_exists(els))
       for (auto& f : ELS_FIXTURES) {
+        if (f.windows) continue;
         CmdResult c = run_capture({els, "top", els_fixture_log(tmp, f)}, 600);
         st_eq(c.out.empty() ? "" : trim(split_lines(c.out)[0]), f.uid, string("error_log_scan.sh agrees on a ") + f.name + " line");
       }
@@ -3006,7 +3366,9 @@ static void st_plumbing() {
     pid_t p = spawn_program({"/bin/sh", "-c", "sleep 30; exit 0"}, tmp + "/sleep.log", tmp, true,
                             {}, true);
     st_check(p > 0, "spawn_program starts a program");
-    st_check(pid_alive(p), "the child is alive");
+    bool child_up = false;                                      // a loaded box can take a moment to show the new process
+    for (int i = 0; i < 50 && !child_up; i++) { child_up = pid_alive(p); if (!child_up) usleep(100000); }
+    st_check(child_up, "the child is alive");
     // right after the fork the child is still a copy of this omnium, and in its exec the line reads empty
     string pcl;
     for (int i = 0; i < 100 && (pcl = proc_cmdline(p)).find("sleep 30") == string::npos; i++) usleep(20000);
@@ -3185,6 +3547,7 @@ static void st_build_plain() {
   st_check(quiet_call(cmd_build, {"13.1", "--jobs"}) == 2 && quiet_call(cmd_build, {"13.1", "--tag"}) == 2, "and says when a flag is missing its value");
   st_check(quiet_call(cmd_parity, {"--nogdb"}) == 2, "parity refuses a flag it does not know, instead of running the whole corpus with gdb");
   st_check(quiet_call(cmd_build, {tmp + "/no_such_tree"}) != 0, "build refuses a path that is not a source tree");
+  if (kTakeFixes) st_check(!dir_exists(g_cfg.test_dir + st_tmp()), "and does not try it as a branch, which left its parent folders under TEST_DIR");
   st_check(quiet_call(cmd_build, {tmp}) != 0, "build refuses a directory with no VERSION file");
   // a flavour named twice is one build: the tree has no CMakeLists.txt, so the one build stops at cmake
   {
@@ -3329,13 +3692,18 @@ static void st_view_and_config() {
       st_check(kid > 0, "the view starts on a terminal");
       if (kid > 0) {
         usleep(400000);                                     // the first frame
-        const char* keys = "?lLrpPsS";
+        const char* keys = "?lL\x0c" "rpsS";                   // Ctrl+L redraws
         for (const char* k = keys; *k; k++) { ssize_t n = write(m, k, 1); (void)n; usleep(150000); }
         string seen;
         int fl = fcntl(m, F_GETFL, 0);
         fcntl(m, F_SETFL, fl | O_NONBLOCK);
         int64_t until = now_s() + 6;
         while (now_s() < until) { char buf[4096]; ssize_t n = read(m, buf, sizeof(buf)); if (n > 0) seen.append(buf, (size_t)n); else usleep(100000); }
+        size_t mark = seen.size();                          // P, the old key, still resumes
+        { ssize_t n = write(m, "P", 1); (void)n; }
+        until = now_s() + 2;
+        while (now_s() < until) { char buf[4096]; ssize_t n = read(m, buf, sizeof(buf)); if (n > 0) seen.append(buf, (size_t)n); else usleep(100000); }
+        bool p_resumes = seen.find("resume asked", mark) != string::npos;
         ssize_t n = write(m, "q", 1); (void)n;
         int st = -1, waited = 0;
         bool reaped = false;
@@ -3350,6 +3718,8 @@ static void st_view_and_config() {
         st_check(reaped && WIFEXITED(st) && WEXITSTATUS(st) == 0, "the view leaves on q");
         st_check(seen.find(basename_of(wd)) != string::npos, "the view drew the run it was given");
         st_check(seen.find("pause asked") != string::npos, "the view answers p with a message");
+        st_check(seen.find("resume asked") != string::npos, "the view answers r with a message");
+        st_check(p_resumes, "the view still takes P, the old key, for resume");
         st_check(seen.find("stop now asked") != string::npos, "the view answers S with a message");
         st_check(seen.find("q quit") != string::npos, "the view answers ? with the key list");
         st_check(file_exists(wd + "/omnium.ctl"), "the keys wrote the run's command file");
@@ -4228,8 +4598,9 @@ static void st_units() {
     st_check(ad.rc == 0 && ad.out.find("2 saved trials, 1 UID") != string::npos, "adopt takes a workdir name on its own and groups the trials by UniqueID [" + trim(ad.out) + "]");
     st_check(child({"adopt", "777777"}, 120).rc == 0, "and the workdir number on its own");
     if (!bpath2.empty()) {
-      // PATH holds nothing, so the screen the reduce asks for is never found and no reducer starts
-      CmdResult rd = run_capture({self_exe(), "adopt", wd, "--reduce", "--screen"}, 300, tmp, {"HOME=" + h, "PATH=" + tmp + "/nowhere"});
+      // PATH holds nothing, so the screen the reduce asks for is never found and no reducer starts. Under
+      // MSYS2 omnium finds its runtime DLL through PATH, so there /usr/bin stays on it, and has no screen.
+      CmdResult rd = run_capture({self_exe(), "adopt", wd, "--reduce", "--screen"}, 300, tmp, {"HOME=" + h, "PATH=" + tmp + "/nowhere" + (kHostMsys2 ? ":/usr/bin" : "")});
       st_check(rd.out.find("reduce:") != string::npos, "adopt --reduce hands each trial to a reducer [" + trim(tail_lines(rd.out, 1)) + "]");
     }
     // the report a run writes for itself: into the child's queue, and named after the trial

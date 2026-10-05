@@ -156,12 +156,37 @@ Registry registry_current() {
   string after = registry_format(r);
   if (!had || after != before) {
     if (registry_save(r)) {
-      if (!had) r.notices.push_back(fmt("created %s from the /test scan: %zu builds listed", g_paths.builds_file.c_str(), r.entries.size()));
+      if (!had) r.notices.push_back(fmt("created %s from the %s scan: %zu builds listed", g_paths.builds_file.c_str(), g_cfg.test_dir.c_str(), r.entries.size()));
     } else {
       r.notices.push_back("cannot write " + g_paths.builds_file);
     }
   }
   return r;
+}
+vector<string> windows_builds_without_mtr(const Registry& r) {
+  vector<string> out;
+  for (auto& e : r.entries) {
+    Basedir b;
+    if (!basedir_parse_name(e.name, b) || !b.windows) continue;
+    b.path = e.path();
+    if (dir_exists(b.path) && basedir_test_dir(b).empty()) out.push_back(e.name);
+  }
+  return out;
+}
+string mtr_suite_fix() {
+  return "the Windows builds of C:\\test come from build.ps1, whose -DBUILD_CONFIG=mysql_release leaves INSTALL_MYSQLTESTDIR empty on Windows, "
+         "so none has mariadb-test. Put '-DINSTALL_MYSQLTESTDIR=mariadb-test' into the cmake arguments of build.ps1 for new builds; "
+         "for one that exists, configure its source again with that flag and install the Test component into it "
+         "(cmake --install <builddir> --component Test): docs/windows.md";
+}
+string test_dir_empty_note() {
+  if (!kTakeFixes || !basedirs_scan(g_cfg.test_dir).empty()) return "";       // Linux says nothing here until it is decided
+  string note = "no build under TEST_DIR " + g_cfg.test_dir;
+  if (kHostMsys2 && g_cfg.test_dir != "/c/test") {
+    size_t n = basedirs_scan("/c/test").size();
+    if (n) note += fmt(", but /c/test (C:\\test) holds %zu: omnium config TEST_DIR=/c/test", n);
+  }
+  return note;
 }
 vector<string> registry_names(const Registry& r, bool test_set) {
   vector<string> out;
@@ -207,14 +232,58 @@ static string search_frame(const string& uid, int* pos) {
   }
   return fx;
 }
+// A UID is what a compiler and a debugger make of the source, and the two platforms spell some things
+// differently where the meaning is the same. GCC prints the NULL macro as __null and MSVC as 0, so a Windows
+// UID reads "thd->free_list == 0" for the assertion the list holds as "thd->free_list == __null". gdb prints
+// a template argument as 64u, true and "List_iterator_fast, Item", and "> >" for a nested list, where MSVC's
+// PDB has 64, 1, "List_iterator_fast,Item" and ">>"; a pointer as "Item*" where MSVC has "Item *"; int64_t
+// as long where MSVC has __int64. A match reads both sides in one spelling. A UID is never rewritten, and a
+// real 0 (x == 0, the leading 0 of a DBUG_ASSERT(0) UID) stays a 0: only the spellings are made one.
+// Only a Windows box does this: a Linux box has one spelling, so its matching stays as it was.
+static string kb_canon(const string& s) {
+  string o;
+  o.reserve(s.size());
+  const size_t n = s.size();
+  auto word = [&](size_t i) { return i < n && (isalnum((unsigned char)s[i]) || s[i] == '_'); };
+  auto is = [&](size_t i, const char* w) { size_t k = strlen(w); return s.compare(i, k, w) == 0 && !word(i + k); };   // the whole word w at i
+  for (size_t i = 0; i < n;) {
+    bool start = i == 0 || !word(i - 1);                       // a word begins here
+    char c = s[i];
+    if (start && is(i, "__null")) { o += '0'; i += 6; }
+    else if (start && is(i, "true")) { o += '1'; i += 4; }
+    else if (start && is(i, "false")) { o += '0'; i += 5; }
+    else if (start && is(i, "__int64")) { o += "long"; i += 7; }
+    else if (start && is(i, "long long")) { o += "long"; i += 9; }
+    else if (start && isdigit((unsigned char)c)) {             // a number: 64u, 4ul and 8ll are 64, 4 and 8
+      size_t e = i, d = i;
+      while (word(e)) e++;
+      while (d < e && isdigit((unsigned char)s[d])) d++;
+      string suffix = lower(s.substr(d, e - d));
+      bool unit = suffix == "u" || suffix == "l" || suffix == "ul" || suffix == "ll" || suffix == "ull";
+      o += s.substr(i, (unit ? d : e) - i);
+      i = e;
+    }
+    else if (c == ',' && i + 1 < n && s[i + 1] == ' ') { o += ','; i += 2; }
+    else if (c == '>' && i + 2 < n && s[i + 1] == ' ' && s[i + 2] == '>') { o += '>'; i += 2; }
+    else if (c == ' ' && i + 1 < n && (s[i + 1] == '*' || s[i + 1] == '&')) i++;
+    else { o += c; i++; }
+  }
+  return o;
+}
+// grep -Fi of a UID in a known-bugs line; on a Windows box both are read as kb_canon does
+bool kb_line_has(const string& line, const string& uid) {
+  return icontains(line, uid) || (kHostMsys2 && icontains(kb_canon(line), kb_canon(uid)));
+}
 KbMatch kb_search(const string& uid) {
   KbMatch m;
   m.san = kb_uid_is_san(uid);
   m.frame = search_frame(uid, &m.frame_pos);
   string txt = read_file(m.san ? g_paths.known_bugs_san : g_paths.known_bugs);
+  string uid_c = kHostMsys2 ? kb_canon(uid) : "", frame_c = kHostMsys2 ? kb_canon(m.frame) : "";
   for (auto& line : split_lines(txt)) {
-    if (icontains(line, uid)) m.exact.push_back(line);
-    if (!m.frame.empty() && icontains(line, m.frame)) m.partial.push_back(line);
+    string line_c = kHostMsys2 ? kb_canon(line) : "";
+    if (icontains(line, uid) || (kHostMsys2 && icontains(line_c, uid_c))) m.exact.push_back(line);
+    if (!m.frame.empty() && (icontains(line, m.frame) || (kHostMsys2 && icontains(line_c, frame_c)))) m.partial.push_back(line);
   }
   return m;
 }
@@ -272,6 +341,45 @@ string uri_escape(const string& s) {
   }
   return o;
 }
+// The assertion texts Jira may hold for a UID read on Windows. Jira has GCC's __null where the UID has
+// MSVC's 0, and the UID cannot say which of its 0s is a NULL. Only a 0 that == or != compares can be
+// one (a pointer is tested against NULL, not with >= or %), so those are read as __null: all of them
+// together, and when there are several, each of them alone. The text with its 0s is searched as well,
+// by the URL before. Nothing when no 0 qualifies, as for any UID without a comparison against 0.
+static vector<string> kb_null_readings(const string& a) {
+  static const std::regex zero("(==|!=) *0(?![A-Za-z0-9_.])");
+  vector<size_t> at;                                           // the offset of each such 0
+  for (std::sregex_iterator it(a.begin(), a.end(), zero), end; it != end; ++it) at.push_back((size_t)(it->position() + it->length() - 1));
+  auto as_null = [&](const vector<size_t>& zeros) {
+    string s = a;
+    for (size_t i = zeros.size(); i-- > 0;) s.replace(zeros[i], 1, "__null");
+    return s;
+  };
+  vector<string> out;
+  if (at.empty()) return out;
+  out.push_back(as_null(at));
+  if (at.size() > 1 && at.size() <= 8) for (size_t z : at) out.push_back(as_null(vector<size_t>{z}));
+  return out;
+}
+// The words of a frame without its template arguments: Bitmap<64>::set_bit is Bitmap and set_bit. Jira holds
+// the frame as gdb printed it (Bitmap<64u>, InnoDBPolicy<true, true>) and a UID read on Windows has the MSVC
+// spelling, so a phrase with the argument finds nothing, where its words find the issue. A frame whose
+// brackets do not pair (operator<) comes back whole.
+static vector<string> kb_frame_words(const string& frame) {
+  string bare;
+  int depth = 0;
+  for (char c : frame) { if (c == '<') depth++; else if (c == '>') { if (depth) depth--; } else if (!depth) bare += c; }
+  vector<string> out;
+  if (depth != 0) { out.push_back(frame); return out; }
+  for (size_t p = 0; p <= bare.size();) {
+    size_t q = bare.find("::", p);
+    string w = trim(bare.substr(p, q == string::npos ? string::npos : q - p));
+    if (!w.empty()) out.push_back(w);
+    if (q == string::npos) break;
+    p = q + 2;
+  }
+  return out;
+}
 vector<string> kb_jira_urls(const string& uid) {
   static const string base = "https://jira.mariadb.org/issues/?jql=";
   static const string tail = "%20ORDER%20BY%20status%20ASC%2Cupdated%20DESC";
@@ -287,8 +395,20 @@ vector<string> kb_jira_urls(const string& uid) {
   a = a.substr(0, a.find('|'));
   a = replace_all(a, "\x01", "||");
   a = replace_all(replace_all(a, "MUTEX_ERROR|", ""), "MUTEX_ERROR", "");
-  if (!a.empty() && a != "SIGSEGV" && a != "SIGABRT" && !kb_uid_is_san(uid))
+  if (!a.empty() && a != "SIGSEGV" && a != "SIGABRT" && !kb_uid_is_san(uid)) {
     urls.push_back(base + "text%20~%20%22%5C%22" + uri_escape(a) + "%5C%22%22" + tail);
+    string alt;
+    if (kHostMsys2)                                            // a Windows box: a 0 may be Jira's __null
+      for (auto& v : kb_null_readings(a)) alt += (alt.empty() ? "" : "%20or%20") + string("text%20~%20%22%5C%22") + uri_escape(v) + "%5C%22%22";
+    if (!alt.empty()) urls.push_back(base + alt + tail);
+  }
+  // on a Windows box, the frames that have a template argument, by their words, in one URL more
+  if (kHostMsys2 && f.size() >= 5 && (fx.find('<') != string::npos || fy.find('<') != string::npos || fz.find('<') != string::npos)) {
+    string q;
+    for (const string* fr : {&fx, &fy, &fz})
+      for (auto& w : kb_frame_words(*fr)) q += (q.empty() ? "" : "%20and%20") + string("text%20~%20%22%5C%22") + uri_escape(w) + "%5C%22%22";
+    urls.push_back(base + q + tail);
+  }
   return urls;
 }
 bool kb_add_to(const string& path, const string& uid, const string& key, string* err) {
@@ -296,7 +416,7 @@ bool kb_add_to(const string& path, const string& uid, const string& key, string*
   if (txt.empty()) { if (err) *err = "cannot read " + path; return false; }
   auto lines = split_lines(txt);
   for (auto& l : lines)
-    if (!starts_with(l, "#") && icontains(l, uid)) { if (err) *err = "already listed: " + l; return false; }
+    if (!starts_with(l, "#") && kb_line_has(l, uid)) { if (err) *err = "already listed: " + l; return false; }
   size_t h = string::npos;
   for (size_t i = 0; i < lines.size(); i++) if (trim(lines[i]) == KB_HEADER) { h = i; break; }
   if (h == string::npos) { if (err) *err = string("header not found in ") + path + ": " + KB_HEADER; return false; }
@@ -474,6 +594,13 @@ int cmd_builds(const Args& a) {
   if (!a.empty() && a[0] != "scan") { printf("usage: omnium builds [scan|edit|test|report|set <name> test=yes|no report=yes|no]\n"); return 2; }
   fputs(registry_format(r).c_str(), stdout);
   print_notices(r);
+  if (r.entries.empty()) { string n = test_dir_empty_note(); if (!n.empty()) printf("note: %s\n", n.c_str()); }
+  if (kHostMsys2) {
+    vector<string> nomtr = windows_builds_without_mtr(r);
+    if (!nomtr.empty())
+      printf("note: no mariadb-test in %zu of %zu builds, so omnium mtr cannot run a testcase on them: %s\n      %s\n",
+             nomtr.size(), r.entries.size(), join(nomtr, ", ").c_str(), mtr_suite_fix().c_str());
+  }
   return 0;
 }
 bool basedir_from_arg(const string& arg, Basedir& b, string* err) {

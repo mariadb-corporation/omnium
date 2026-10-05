@@ -29,7 +29,7 @@ static const Verb VERBS[] = {
   {"matrix", cmd_matrix, "replay a testcase on the report builds (or the builds named): matrix <sql> [build ...] [--slots N] [--out FILE]"},
   {"report", cmd_report, "the bug report of a reduced trial, into the inbox: report [<workdir>] <trial> [build ...] [--no-matrix] [--no-mtr]"},
   {"mtr", cmd_mtr, "the MTR form of a testcase, verified as a reverse gate: mtr [<workdir>] <trial> | mtr <sql> --basedir DIR"},
-  {"tui", cmd_tui, "the live view of a run: panels, 1 s refresh; keys q p P s S l L r; tui [<run>] [--plain]"},
+  {"tui", cmd_tui, "the live view of a run: panels, 1 s refresh; keys q p r s S l L, ^L redraws; tui [<run>] [--plain]"},
   {"cli", cmd_cli, "a shell with the omnium shortcuts (h shows them in a box, h <name> explains one); the prompt says which build or trial you are in"},
   {"fresh", cmd_fresh, "a fresh server for the basedir in the cwd or named, datadir on tmpfs: fresh [basedir] [--cl] [--keep] [--datadir DIR] [--options \"...\"]; --keep leaves a server that is already up alone"},
   {"cl", cmd_cl, "a client on the server omnium fresh started: cl [basedir] [client args]"},
@@ -132,6 +132,27 @@ static bool looks_like_setting(const string& s) {
   return true;
 }
 
+// The verbs that run for long, and so fork for long. Under MSYS2 fork() starts the child from the file the process
+// was started from, so a rebuild of omnium.exe under a live run stopped every later fork of it (a run stalled with
+// "cannot spawn a trial child"). These verbs therefore start from a copy of the binary that nothing replaces,
+// private_exe_copy, and omnium.exe is free to be rebuilt. Off MSYS2 this does nothing.
+static bool long_verb(const string& v) {
+  for (const char* n : {"run", "tui", "matrix", "report", "reduce", "mtr", "adopt", "parity", "build", "selftest"}) if (v == n) return true;
+  return false;
+}
+static void start_from_private_copy(char** argv) {
+  if (!kHostMsys2 || getenv("OMNIUM_COPY")) return;
+  string self = self_exe();
+  if (basename_of(self) == "omnium.bin") return;                 // a run's own copy already
+  string copy = private_exe_copy(self);
+  if (copy.empty() || copy == self) return;
+  setenv("OMNIUM_COPY", "1", 1);
+  setenv("OMNIUM_REPO", repo_dir().c_str(), 1);
+  execv(copy.c_str(), argv);
+  unsetenv("OMNIUM_COPY");                                       // it would not start: go on from this one
+  unsetenv("OMNIUM_REPO");
+}
+
 int main(int argc, char** argv) {
   // a subreducer: the reducer starts copies of its own executable (this binary) with its
   // REDUCER_* variables set and the input file as the only argument
@@ -148,7 +169,12 @@ int main(int argc, char** argv) {
   }
   if (!all.empty() && (all[0] == "--version" || all[0] == "-V")) return cmd_version({});
   if (!all.empty() && (all[0] == "--help" || all[0] == "-h")) return cmd_help({});
-  if (!all.empty() && all[0] == "--selftest") return cmd_selftest(Args(all.begin() + 1, all.end()));
+  if (!all.empty() && all[0] == "--selftest") { start_from_private_copy(argv); return cmd_selftest(Args(all.begin() + 1, all.end())); }
+  {
+    string first;                                                // the verb: the first argument that is no KEY=VALUE setting
+    for (auto& a : all) if (!looks_like_setting(a)) { first = a; break; }
+    if (long_verb(first)) start_from_private_copy(argv);
+  }
   config_load(true);
   Args rest;
   const char* inherited = getenv("OMNIUM_SET");

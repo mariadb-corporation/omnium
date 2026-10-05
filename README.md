@@ -87,7 +87,7 @@ report, while the discovery slots keep going.
 | `inbox [--process] [--dry-run] [--file <item>]` | the human queue; `touch <item>.ok` approves an item |
 | `jira whoami`, `jira search <uid>`, `jira versions`, `jira components` | Jira over REST, read only |
 | `mail <to> [--mx DOMAIN] [--dry-run]` | the mail path a new inbox item uses, for a check |
-| `tui [<run>]` | the live view of a run; keys q p P s S l L r |
+| `tui [<run>]` | the live view of a run; keys q p r s S l L, Ctrl+L redraws |
 | `cli` | a shell with the omnium shortcuts; `h` shows them in a box, `h <name>` explains one |
 | `fresh [basedir] [--cl]`, `cl`, `replay <file>`, `trial <n>` | a server by hand, its client, a replay, one trial's detail |
 | `kb`, `kba`, `kbs`, `kbsa`, `eb` | the known-bug lists and `BUGS/` |

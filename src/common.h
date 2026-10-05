@@ -86,11 +86,28 @@ string home_dir();
 // The box: omnium built under MSYS2 runs on Windows (docs/windows.md), anything else is Linux
 #if defined(__MSYS__) || defined(__CYGWIN__)
 inline constexpr bool kHostMsys2 = true;
+#define OMNIUM_FORK_PLAN 1                                      // the forks make an ExecPlan first (see ExecPlan below); elsewhere they are as they were
 #else
 inline constexpr bool kHostMsys2 = false;
 #endif
+// Fixes the Windows port found that are not about Windows (a page size that never reached the datadir, a root
+// turned away that was filed as a bug, ...). Linux keeps its behaviour until the user decides; true here takes
+// them there as well, and kTakeFixes is what each of them tests.
+inline constexpr bool kFixesOnLinux = false;
+inline constexpr bool kTakeFixes = kHostMsys2 || kFixesOnLinux;
 // the user's Windows profile as an MSYS2 path, /c/Users/Roel; "" off MSYS2
 string windows_home();
+// A copy of an executable that nothing replaces, for MSYS2 ("" elsewhere, or when it cannot be made): its fork() starts the
+// child by launching the parent's exe again by its path and copying the parent's memory into it, so a process whose exe was
+// replaced on disk (a rebuild of omnium.exe) can never fork again ("child_copy: data read copy failed ... error 299",
+// errno 11): a run stalled that way. The verbs that run for long start from this copy instead, in /tmp/omnium_exe.
+string private_exe_copy(const string& exe);
+// an absolute POSIX path as a native Windows program reads it, C:/msys64/dev/shm/x; "" when it is not one, and off MSYS2
+string native_path(const string& posix);
+// A server option for a native Windows server with its path made native. The MSYS2 runtime converts a plain
+// --opt=/path of an argument itself when it starts a native program, but not --opt=FILE:/path, which then
+// reaches the server as /dev/shm/... and is looked for on the wrong drive. A value without a path is kept.
+string native_option(const string& opt);
 // the person's own home: $HOME, and on Windows the profile, as the MSYS2 home is a folder of the
 // shared MSYS2 install (a HOME that was set to something else is kept)
 string user_home();
@@ -131,6 +148,26 @@ CmdResult run_shell(const string& script, int timeout_s = 0, const string& cwd =
 // the same with text on the child's stdin (a gdb command list)
 CmdResult run_capture_in(const vector<string>& argv, const string& stdin_text, int timeout_s = 0, const string& cwd = "",
                          const vector<string>& env_add = {});
+// Everything a child needs, made before the fork. Cygwin copies only the forking thread's stack into
+// the child: what the child reads that lives on another thread's stack (a reference to the caller's
+// std::string, say) is unmapped there, and the first read kills it with SIGSEGV. That ended every
+// trial under MSYS2: the generator is spawned from a thread, and its directory was a string on the
+// main thread's stack. So argv, environment, program, directory and log are copied into a plan,
+// which lives on the forking thread's own stack, and the child touches nothing but the plan, its
+// own locals, the heap and globals. (A child of a process with threads may call only
+// async-signal-safe functions anyway, so it allocates nothing.) Every fork in omnium makes a plan
+// first, and the child calls exec_plan_run(plan) once its descriptors are set.
+struct ExecPlan {
+  vector<char*> av, envp;     // null-terminated; they point into the strings the plan was made from
+  string path;                // what is exec'd: argv[0], or where PATH finds it
+  string cwd;                 // the child changes to it first; "" = stays where it is
+  string log;                 // the child's stdout and stderr are appended to it; "" = left as they are
+  bool own_env = false;       // envp is the environment to hand over; false = the process's own
+};
+ExecPlan exec_plan(const vector<string>& argv, const vector<string>& env_add = {},   // env_add: KEY=VALUE, set over the environment
+                   const string& cwd = "", const string& log = "");
+[[noreturn]] void exec_plan_run(const ExecPlan& p);           // execve; _exit(127) when that fails
+string wait_status_text(int st);                              // a raw wait status in words: "exit 3", "killed by signal 11 (SIGSEGV)"
 
 // ---------------------------------------------------------------------------------------------
 // log
@@ -195,15 +232,17 @@ struct Config {
   int cores_parallel = 2;             // cores being written at once
   bool follow = true;                 // daily remote check of every branch under test
   string qa_dir;                      // the mariadb-qa checkout; empty = ~/mariadb-qa when present, else <repo>/mariadb-qa
-  string test_dir = "/test";
+  string test_dir = kHostMsys2 ? "/c/test" : "/test";   // MSYS2 names C:\test /c/test; its own /test is C:\msys64\test, where no build is
   string data_dir = "/data";
   string shm_dir = "/dev/shm";
   string editor;                      // kb edit, eb
   string infile;                      // INFILE; empty = the pquery tarball
+  string perl;                        // PERL: the native Windows perl MTR runs with; empty = look for one (omnium mtr, Windows only)
   bool all_disk_sql = true;           // the all-disk source
 };
 extern Config g_cfg;
 string config_path();
+string repo_dir();                                            // the omnium checkout; OMNIUM_REPO when a copy of the binary runs
 void config_load(bool write_defaults_when_missing);
 bool config_set(const string& key, const string& value);      // false = unknown key, or a value the key does not take
 bool config_get(const string& key, string& value);            // false = unknown key
@@ -369,6 +408,7 @@ bool version_at_least(const string& v, const string& floor);
 
 // one datadir template per basedir + MYINIT, made once, under <workdir>/templates
 string template_for(const Basedir& b, const string& myinit, const string& templates_root);
+string myinit_from(const string& options);                     // the options that shape a datadir when it is made (the page size), out of a server option string
 // the install-db command line: the Linux script's options, or the Windows tool's own set
 vector<string> install_db_argv(const Basedir& b, const string& datadir, const string& tmpdir, const string& myinit);
 
@@ -392,6 +432,8 @@ struct Instance {
   string start_note;
   vector<string> extra;     // MYEXTRA and friends, one option per entry
   string myinit;
+  bool stopping = false;    // omnium asked it to stop (shutdown, kill_hard): how it ends is no finding
+  int exit_status = -1;     // the raw wait status, once alive() has seen it end on its own
   void set_paths(const string& trial_root, const string& datadir_override = "");
   Endpoint endpoint() const { return {sock, port, tcp}; }
   vector<string> argv() const;
@@ -402,10 +444,18 @@ struct Instance {
   bool shutdown(int timeout_s, string* note = nullptr);        // clean; false = did not stop in time, note says what the admin client said
   void kill_hard();
   bool has_core() const;
+  bool has_dump() const;      // Windows: the minidump the server leaves in its datadir when it crashes
   string core_path() const;
+  // Windows: the server ended on its own with a status that is no clean exit, and left no minidump. A failed /GS stack
+  // cookie check or a __fastfail kills a release server with no banner in the log and no dump; Cygwin reports that
+  // death, an NTSTATUS it has no signal for (0xC0000409), as exit status 127.
+  bool silent_death() const;
+  string silent_death_uid() const;                              // CRASH_NO_LOG|exit status N
 };
 // the start/stop/cl helpers of a saved trial, and the gdb one when it has a core
 void write_helpers(const string& tdir, const Basedir& b, const Instance& inst, const string& myextra, bool core);
+bool root_turned_away(const string& text);                    // a start or backup step that failed because the trial's SQL locked root out: a configured state, no finding
+bool backup_is_encrypted(const vector<string>& myextra);      // the server ran with the key plugin: its backup is prepared with its own backup-my.cnf
 
 // ---------------------------------------------------------------------------------------------
 // registry.cpp - /test/omnium.builds, the known-bugs lists, BUGS/ files, the regex lists
@@ -432,7 +482,15 @@ bool registry_save(const Registry& r, const string& path = "");
 string registry_format(const Registry& r);
 void registry_sync(Registry& r, const vector<Basedir>& scanned, bool first_import, bool check_disk = true);
 Registry registry_current();                                   // load, scan /test, sync, save when changed
+// "" when TEST_DIR holds a build; else that it holds none, and on MSYS2 the /c/test that does (a settings
+// file from before /c/test became the default still says /test, which there is C:\msys64\test)
+string test_dir_empty_note();
 vector<string> registry_names(const Registry& r, bool test_set);
+// The registered Windows builds that have no mariadb-test, by name: omnium mtr cannot run a testcase on
+// them. And what to do about it. The builds of C:\test come from build.ps1, which passes
+// -DBUILD_CONFIG=mysql_release, and that leaves INSTALL_MYSQLTESTDIR empty on Windows.
+vector<string> windows_builds_without_mtr(const Registry& r);
+string mtr_suite_fix();
 const BuildEntry* registry_find(const Registry& r, const string& name_or_path);
 
 enum class KbVerdict { NotFound, Partial, Known, FixedOnly, KnownAndFixed };
@@ -440,6 +498,7 @@ struct KbMatch { bool san = false; vector<string> exact, partial; string frame; 
 bool kb_uid_is_san(const string& uid);                         // "SAN" anywhere, as tt decides
 string kb_file_for(const string& uid);
 KbMatch kb_search(const string& uid);                          // grep -Fi on the whole UID and on the frame
+bool kb_line_has(const string& line, const string& uid);       // grep -Fi of a UID in a known-bugs line, __null and 0 read as one
 KbVerdict kb_verdict(const KbMatch& m);
 vector<string> kb_keys(const vector<string>& lines);           // the MDEV-n / MENT-n keys in kb lines
 string kb_verdict_text(const string& uid, const KbMatch& m);   // tt's String Scan block, same wording
@@ -627,6 +686,10 @@ bool mx_parse(const unsigned char* answer, int len, vector<string>& hosts);   //
 bool mail_send(const string& to, const string& subject, const string& body, string* err, bool dry_run = false);
 bool mtr_make(const string& sql_text, const string& options, const Basedir* b, const string& uid, MtrTest& t, string* err);
 bool mtr_verify(const Basedir& b, MtrTest& t, const string& tag, MtrVerdict& v, string* err);
+// The perl MTR runs with on Windows: the PERL setting, else the usual homes of Strawberry Perl, else the PATH, and each one is
+// asked what $^O is. MSYS2's perl and Git's say msys, MTR then takes the box for Cygwin and demands --cygwin-subshell-fix=do,
+// which puts a wrapper over /bin/sh, the shell omnium itself runs on. "" and the reason when there is no native perl.
+string native_perl_find(string* why);
 // the runner's output, read into a verdict; suppress collects one mtr.add_suppression line per
 // flagged log line the testcase itself makes
 void mtr_parse_verdict(const string& out, int rc, const string& test_name, bool crash_at_statement, MtrVerdict& v, vector<string>* suppress);

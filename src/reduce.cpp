@@ -59,12 +59,12 @@ string find_core(const string& tdir) {
   }
   return "";
 }
-// the first known-bugs line that carries the UID (grep -Fi); a line starting with # is a fixed bug
+// the first known-bugs line that carries the UID (grep -Fi, as kb_line_has reads it); a line starting with # is a fixed bug
 bool uid_in_known_lists(const string& uid) {
   if (uid.empty()) return false;
   for (const string& f : {g_paths.known_bugs, g_paths.known_bugs_san}) {
     for (auto& l : split_lines(read_file(f))) {
-      if (!icontains(l, uid)) continue;
+      if (!kb_line_has(l, uid)) continue;
       return !starts_with(trim(l), "#");
     }
   }

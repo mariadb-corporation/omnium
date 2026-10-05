@@ -76,6 +76,14 @@ static vector<Key>& keys() {
     {"ALL_DISK_SQL", "1 = every .sql file on the disk is a source as well",
      [] { return string(g_cfg.all_disk_sql ? "1" : "0"); }, [](const string& v) { g_cfg.all_disk_sql = v == "1" || iequals(v, "yes") || iequals(v, "true"); return true; }},
   };
+  // a setting only the Windows build has: Linux lists exactly the keys it did
+  static const bool windows_keys = [] {
+    if (kHostMsys2)
+      k.push_back({"PERL", "the native perl MTR runs with (Strawberry Perl); empty = C:\\Strawberry, C:\\Perl64, ~\\tools\\strawberry-perl, then the PATH",
+                   [] { return g_cfg.perl; }, [](const string& v) { g_cfg.perl = v; return true; }});
+    return true;
+  }();
+  (void)windows_keys;
   return k;
 }
 
@@ -183,8 +191,11 @@ vector<std::pair<string, string>> config_keys_help() {
   for (auto& e : keys()) v.push_back({e.name, e.help});
   return v;
 }
-// the omnium checkout: the directory of the binary, or two levels up when it runs from build/<mode>/
-static string repo_dir() {
+// the omnium checkout: the directory of the binary, or two levels up when it runs from build/<mode>/. A binary that
+// started from a copy of itself (private_exe_copy, MSYS2) is told where the checkout is by OMNIUM_REPO, which its
+// children inherit.
+string repo_dir() {
+  if (const char* r = getenv("OMNIUM_REPO")) if (*r) return r;
   string exe = self_exe();
   string repo = exe.empty() ? "." : dirname_of(exe);
   if (!file_exists(repo + "/omnium.san.opt") && file_exists(repo + "/../../omnium.san.opt")) repo = abs_path(repo + "/../..");

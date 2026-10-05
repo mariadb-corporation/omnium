@@ -45,7 +45,10 @@ build uses the MSYS2 packages, not the mingw ones. Under MSYS2 `build.sh` differ
 
 ## Where things live
 
-`TEST_DIR` is `/c/test`, which is how MSYS2 names `C:\test`. A Windows basedir is named
+`TEST_DIR` defaults to `/c/test` here (`/test` on Linux), which is how MSYS2 names `C:\test`. MSYS2's
+own `/test` is `C:\msys64\test`, where no build is. A settings file written before that default
+still says `/test`: `omnium builds` and `omnium init` then say that `TEST_DIR` holds no build, and
+that `/c/test` does, and `omnium config TEST_DIR=/c/test` fixes it. A Windows basedir is named
 `MD<ddmmyy>-mariadb-<version>-windows-x86_64-<opt|dbg>`, and the name parser marks it as a Windows
 build.
 
@@ -74,7 +77,12 @@ and `omnium replay` clients. The server gets `--port=` and no `--socket=`, which
 name a pipe nobody opens. A saved trial's `start`, `stop` and `cl` scripts carry the same
 `-h127.0.0.1 -P<port> --protocol=tcp --skip-ssl` arguments (no TLS on the loopback, so the client
 tool does not warn about a passwordless login), and the FederatedX area's `CREATE SERVER` names
-`HOST '127.0.0.1', PORT <port>` where the Linux SQL names the socket file.
+`HOST '127.0.0.1', PORT <port>` where the Linux SQL names the socket file. The in-process client turns
+TLS off for that connection too (`MYSQL_OPT_SSL_ENFORCE` and `MYSQL_OPT_SSL_VERIFY_SERVER_CERT` off):
+Connector/C 3.4 switches TLS on for a connection that verifies the server certificate, which is its
+default, and then refuses a server that has none, as a 10.11 build has not
+(`SSL is required, but the server does not support it`). A matrix row for a build that did not start
+reads "server did not start", and takes no UID from the noise of aborted connections in its log.
 
 The switch is the basedir: a `-windows-` name puts the trial on TCP. `OMNIUM_TCP=1` in the
 environment does the same for a Linux build, which is how the TCP path is exercised on Linux:
@@ -85,10 +93,19 @@ Plugins are named without an extension in the SQL (`INSTALL SONAME 'ha_federated
 loads `ha_federatedx.dll` on Windows and `.so` on Linux, and an area that needs a plugin looks for
 the `.dll` in a Windows basedir.
 
+A server option with a path has to be native for a native server. The MSYS2 runtime converts a plain
+`--opt=/path` itself when it starts a Windows program, but not `--opt=FILE:/path`, which then reaches
+the server as `/dev/shm/...` and is looked for on the wrong drive (the `innodb-encryption` area's
+`--file-key-management-filekey=FILE:...` never started). `Instance::argv()` and the `start` script of a
+saved trial therefore turn the path of such an option into `C:/msys64/dev/shm/...`
+(`native_option` in `util.cpp`).
+
 ## The datadir template
 
 `mariadb-install-db.exe` has its own option set. omnium calls it with `--datadir=` alone, plus
-`--innodb-page-size=` when MYINIT sets a page size; the Linux options (`--no-defaults`,
+`--innodb-page-size=` when MYINIT sets a page size (`omnium matrix`, `omnium fresh` and the MTR
+replays put the page size of a testcase's `mysqld options required for replay` header into MYINIT, as
+the server refuses a datadir made with another one); the Linux options (`--no-defaults`,
 `--basedir=`, `--force`, `--auth-root-authentication-method=normal`, the buffer pool cap and any
 other MYINIT option) do not exist there and are left out. The tool writes a `my.ini` into the
 datadir; the server runs with `--no-defaults` and never reads it.
@@ -98,6 +115,70 @@ datadir; the server runs with `--no-defaults` and never reads it.
 MSYS2's `/proc/meminfo` has no `MemAvailable` line. The RAM governor and the slot sizing take
 `MemFree` instead, which reads lower than the Linux figure, so the same `RAM_CAP_PCT` is a little
 more cautious on Windows.
+
+MSYS2 has no tmpfs: `SHM_DIR` (`/dev/shm`) is a plain folder of the MSYS2 install, `C:\msys64\dev\shm`,
+so the trials run on disk and `SHM_CAP_PCT`, `SHM_PAUSE_PCT` and `SHM_STEPDOWN_PCT` measure that
+disk's use, not RAM's. `omnium init` says so rather than printing the disk's size as RAM. `SHM_DIR=`
+can name a folder on a RAM disk to get the Linux behaviour.
+
+## Child processes
+
+Cygwin copies only the forking thread's stack into a forked child. A child of a thread other than
+the main one therefore cannot read anything that lives on another thread's stack, such as a
+`std::string` the caller passed by reference: the first read ends it with SIGSEGV. That was why
+every trial failed with `generator rc 11`, since the generator is started from a thread with a
+directory that sat on the main thread's stack. So every fork (`run_capture`, `run_capture_in`,
+`spawn_program`, `spawn_role`) first copies argv, the environment, the program's path (a bare
+command is looked up on the `PATH` the child is given), the directory and the log into an
+`ExecPlan` on its own stack, and the child touches nothing but that, its locals, the heap and
+globals. The failure reads `generator killed by signal 11 (SIGSEGV)`, with the last lines of the
+log, instead of the raw wait status.
+
+**A rebuild of `omnium.exe` must not reach a process that runs from it.** `fork()` under MSYS2 starts
+the child by launching the parent's executable again, by its path, and copying the parent's memory
+into it. When a different file stands at that path (a rebuilt `omnium.exe`), the child image does not
+match and the copy fails for every fork from then on: `child_copy: data read copy failed ... Win32
+error 299`, then `CreateThread failed for sig ... error 193`, then `errno 11`. A run stalled that way,
+logging `cannot spawn a trial child` every two seconds, and the README's "a rebuild cannot change a
+live run" is only true because of what follows. So the verbs that run for long (`run`, `tui`,
+`matrix`, `report`, `reduce`, `mtr`, `adopt`, `parity`, `build`, `selftest`) first start from a copy of the
+binary, `/tmp/omnium_exe/omnium-<size>-<mtime>.exe` (`private_exe_copy`; `OMNIUM_COPY` marks the copy and
+`OMNIUM_REPO` tells it where the checkout is), and `omnium.exe` is free to be rebuilt. A run keeps its roles
+on a copy of its own, `omnium.bin` in its workdir, as before. Copies that nothing runs go once they are ten
+minutes old; opening a running exe for writing fails with "Device or resource busy", which is how one in use
+is told. A process started before this existed, or from `omnium.exe` by any other verb, still depends on
+the file: **`build.sh` therefore never replaces an `omnium.exe` that is in use.** It waits ten seconds for
+it, and then leaves the build as `omnium.exe.new` and says so.
+
+The all-disk SQL set (`ALL_DISK_SQL=1`) is not `find /` here: `/` is the MSYS2 install, and its
+`/proc/registry` is the Windows registry as folders, which `find` walks for minutes. The scan
+covers the Windows profile, the MSYS2 home, `TEST_DIR` and `DATA_DIR`, without `AppData` and the
+`.git` folders.
+
+## MTR (`omnium mtr`, and the MTR part of `omnium report`)
+
+A testcase is verified by running it under the build's own `mariadb-test-run.pl`. On Windows that
+needs two things the builds and the box do not have by default.
+
+- **The suite in the build.** The Windows builds of `C:\test` come from `build.ps1`, which passes
+  `-DBUILD_CONFIG=mysql_release`, and `cmake/build_configurations/mysql_release.cmake` leaves
+  `INSTALL_MYSQLTESTDIR` empty on Windows, so a build has no `mariadb-test` folder. For a new build
+  put `'-DINSTALL_MYSQLTESTDIR=mariadb-test'` into the cmake arguments of `build.ps1`. For one that
+  exists, configure its source again with that flag and install the Test component into it
+  (`cmake --install <builddir> --component Test --prefix <basedir>`); that adds `mariadb-test`
+  (some 18000 files, 260 MB) and the test plugins in `lib\plugin`, and leaves the server alone.
+  `omnium builds` and `omnium init` name every registered Windows build without it, and
+  `omnium mtr` says the same instead of "no test runner". omnium does not build on Windows
+  (`omnium build` is not ported), so no cmake line of its own carries the flag.
+- **A native Windows perl.** MTR on MSYS2's perl (`$^O` is `cygwin` or `msys`) takes the box for
+  Cygwin and stops with `Cygwin /bin/sh subshell requires fix with --cygwin-subshell-fix=do`. That
+  flag puts a wrapper over `/bin/sh`, which omnium itself runs on: never use it. MTR wants Strawberry
+  Perl (`$^O` is `MSWin32`); the portable zip needs no admin rights. omnium finds the perl in this
+  order: the `PERL` setting, `C:\Strawberry\perl\bin`, `C:\Perl64\bin`, `C:\Perl\bin`,
+  `%USERPROFILE%\tools\strawberry-perl\perl\bin`, then every `perl.exe` on the `PATH`, and takes the
+  first one that answers `MSWin32` to `print $^O`. Its folder goes first on the `PATH` of the
+  runner. The `--vardir` and `--tmpdir` arguments are MSYS2 paths, which the runtime converts for a
+  native program, so they need no handling. `omnium init` checks for the perl as well.
 
 ## The UniqueID of a Windows crash
 
@@ -132,6 +213,25 @@ reads as on Linux. The UID shapes are the Linux ones: `SIGSEGV|f1|f2|f3|f4` for 
 The version directory under the builds' root is scrubbed to `/test/X/` on both sides. `TEST_DIR`
 names the root, and for `/c/test` the native `C:\test\` and `C:/test/` count too, with the rest of
 that path turned to slashes, so the same line gives the same UID on both boxes.
+
+A frame is named as gdb names it where MSVC differs: X::`scalar deleting destructor' is the second
+X::~X frame, std::_Atomic_storage<T,N> is std::__atomic_base<T>, `anonymous namespace' is (anonymous
+namespace). A failed /RTC1 run-time check (failwithmessage, _RTC_* frames) is no frame, as abort() is
+none, and the check that failed (_RTC_StackFailure, _RTC_UninitUse) stands where an assertion's text
+does. Spelling is not renamed but read as one when a UID is looked up in the known-bugs lists
+(Windows only): __null is 0, 64u is 64, true is 1, 'A, B' is 'A,B', '> >' is '>>', 'Item *' is
+'Item*', __int64 is long; a real 0 stays 0 and a UID stays as printed. An error-log line of a Windows
+server says mariadbd.exe: where Linux says mariadbd:. s/mariadbd.exe/mariadbd/ (and mysqld.exe,
+mariadb.exe, mysql.exe) is done once, as the error-log lines are read, so every rule sees a Windows
+line as its Linux twin. `omnium parity` gives the scripts a copy of a Windows log with mariadbd.exe
+and mysqld.exe stripped, as the port reads it, so the two chains compare the same text.
+
+A crash leaves `mariadbd.dmp` in the datadir, and that dump is what a core is to a trial
+(`Instance::has_dump`): the trial takes the crash UID from the frames in the log even when the
+error-log scan flagged another line as well, as a core wins on Linux. Before that a trial whose log had
+both was saved with the flagged line's UID (`SLAVE_ERROR|...`) in `MYBUG`, and the crash was filed as
+noise. A flagged line with no crash gets the UID `omnium t` gives it (the same function), so `MYBUG`
+and `omnium t` agree; the scan's own pick stays when the chain has none.
 
 ## What does not carry over
 

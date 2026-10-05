@@ -28,6 +28,12 @@ bool endpoint_connect(MYSQL* m, const Endpoint& e, const char* user, const char*
   if (e.tcp) {
     unsigned proto = MYSQL_PROTOCOL_TCP;
     mysql_options(m, MYSQL_OPT_PROTOCOL, &proto);
+    // No TLS on the loopback, as the client tools get --skip-ssl. Connector/C 3.4 switches TLS on for a
+    // connection that verifies the server certificate, which is its default, and then refuses a server
+    // with no TLS (a 10.11 build): "SSL is required, but the server does not support it".
+    my_bool off = 0;
+    mysql_options(m, MYSQL_OPT_SSL_VERIFY_SERVER_CERT, &off);
+    mysql_options(m, MYSQL_OPT_SSL_ENFORCE, &off);
     return mysql_real_connect(m, "127.0.0.1", user, "", db, (unsigned)e.port, nullptr, flags) != nullptr;
   }
   return mysql_real_connect(m, nullptr, user, "", db, 0, e.sock.c_str(), flags) != nullptr;

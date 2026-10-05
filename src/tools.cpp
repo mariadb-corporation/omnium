@@ -184,11 +184,21 @@ int cmd_init(const Args& a) {
   check(file_exists(script_path("new_text_string.sh")), "the UID scripts (new_text_string.sh and friends) in " + g_paths.qa, "clone mariadb-qa there, or point QA_DIR at the checkout");
   check(file_exists(script_path("reducercpp/stages.tbl")), "stages.tbl (the reducer's sed stages)", "it comes with the mariadb-qa checkout at QA_DIR");
   check(file_exists(g_paths.sql_filter), "filter.sql (the SQL the trials leave out)", "it comes with the mariadb-qa checkout at QA_DIR");
-  check(dir_exists(g_cfg.test_dir), "the build dir " + g_cfg.test_dir, "sudo mkdir " + g_cfg.test_dir + " && sudo chown $USER " + g_cfg.test_dir);
-  check(dir_exists(g_cfg.data_dir), "the results dir " + g_cfg.data_dir, "sudo mkdir " + g_cfg.data_dir + " && sudo chown $USER " + g_cfg.data_dir);
-  check(dir_exists(g_cfg.shm_dir) && dir_total_bytes(g_cfg.shm_dir) >= ram_total_bytes() / 4,
-        "/dev/shm is " + human_bytes(dir_total_bytes(g_cfg.shm_dir)) + " of " + human_bytes(ram_total_bytes()) + " RAM (trials run there; the framework sizes it to about 80%)",
-        "mount -o remount,size=80% /dev/shm (see ~/mariadb-qa/setup_server.sh)");
+  // there is no sudo under MSYS2, and a folder there is the person's own to make
+  auto mkdir_how = [](const string& d) { return kHostMsys2 ? "mkdir -p " + d : "sudo mkdir " + d + " && sudo chown $USER " + d; };
+  check(dir_exists(g_cfg.test_dir), "the build dir " + g_cfg.test_dir, mkdir_how(g_cfg.test_dir));
+  check(dir_exists(g_cfg.data_dir), "the results dir " + g_cfg.data_dir, mkdir_how(g_cfg.data_dir));
+  if (kHostMsys2) {
+    // MSYS2 has no tmpfs: /dev/shm is a plain folder of its install, so the size is the disk's, not RAM's
+    check(dir_exists(g_cfg.shm_dir),
+          "the trial dir " + g_cfg.shm_dir + " is a folder on a " + human_bytes(dir_total_bytes(g_cfg.shm_dir)) + " disk, not RAM (Windows has no tmpfs: "
+          "SHM_CAP_PCT, SHM_PAUSE_PCT and SHM_STEPDOWN_PCT measure that disk; SHM_DIR= can name a RAM disk)",
+          mkdir_how(g_cfg.shm_dir));
+  } else {
+    check(dir_exists(g_cfg.shm_dir) && dir_total_bytes(g_cfg.shm_dir) >= ram_total_bytes() / 4,
+          "/dev/shm is " + human_bytes(dir_total_bytes(g_cfg.shm_dir)) + " of " + human_bytes(ram_total_bytes()) + " RAM (trials run there; the framework sizes it to about 80%)",
+          "mount -o remount,size=80% /dev/shm (see ~/mariadb-qa/setup_server.sh)");
+  }
   {
     string pat = read_file(g_cfg.pat_file);
 #ifdef __linux__
@@ -209,7 +219,21 @@ int cmd_init(const Args& a) {
   }
   {
     Registry r;
-    check(registry_load(r) && !r.entries.empty(), "the build registry " + g_paths.builds_file, "omnium builds (after at least one build under " + g_cfg.test_dir + ", or omnium build 13.1)");
+    bool listed = registry_load(r) && !r.entries.empty();
+    string empty = listed ? "" : test_dir_empty_note();                 // a TEST_DIR that holds no build is the usual reason
+    check(listed, "the build registry " + g_paths.builds_file,
+          (empty.empty() ? "" : empty + "; ") + "omnium builds (after at least one build under " + g_cfg.test_dir +
+          (kHostMsys2 ? "; omnium build is not ported, the Windows builds come from build.ps1: docs/windows.md)" : ", or omnium build 13.1)"));
+    if (kHostMsys2 && listed) {                                         // omnium mtr runs a testcase from the build's own mariadb-test
+      vector<string> nomtr = windows_builds_without_mtr(r);
+      check(nomtr.empty(), "mariadb-test in every Windows build of the registry (omnium mtr runs testcases from it)",
+            "missing in " + std::to_string(nomtr.size()) + " of " + std::to_string(r.entries.size()) + ": " + join(nomtr, ", ") + "; " + mtr_suite_fix());
+    }
+  }
+  if (kHostMsys2) {                                                     // MTR is a perl program, and on Windows it needs a native perl
+    string why;
+    string p = native_perl_find(&why);
+    check(!p.empty(), p.empty() ? "a native Windows perl for omnium mtr" : "a native Windows perl for omnium mtr: " + p, why);
   }
   mkdirs(g_paths.human_queue);
   mkdirs(g_paths.ai_queue);

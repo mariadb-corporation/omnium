@@ -4,6 +4,7 @@
 /omnium_*
 /omnium.failed
 /omnium.exe.failed
+/omnium.exe.new
 /o
 .ninja_deps
 .ninja_log

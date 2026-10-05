@@ -99,6 +99,16 @@ string per_line(const string& text, const std::function<string(const string&)>& 
   }
   return out;
 }
+// A Windows server is mariadbd.exe where a Linux one is mariadbd, so its error log reads "[ERROR]
+// mariadbd.exe: Table ..." for the "[ERROR] mariadbd: Table ..." that REGEX_ERRORS_SCAN and
+// REGEX_ERRORS_FILTER, uid_prefix and every rule below are written against. s/mariadbd.exe/mariadbd/ is
+// done once, as the lines are read, so that nothing past that point has to know the name. The same for
+// mysqld.exe, and for the client names mariadb.exe and mysql.exe.
+string strip_exe_names(const string& l) {
+  if (!icontains(l, ".exe")) return l;
+  RXI(exe, "\\b(mariadbd|mariadb|mysqld|mysql)\\.exe\\b");
+  return exe.sub(l, "$1", true);
+}
 // the lines grep sees: every line, a final one without a newline included
 vector<string> grep_lines(const string& text) {
   vector<string> v;
@@ -109,7 +119,10 @@ vector<string> grep_lines(const string& text) {
     v.push_back(text.substr(pos, nl - pos));
     pos = nl + 1;
   }
-  for (auto& l : v) if (!l.empty() && l.back() == '\r') l.pop_back();   // a Windows error log ends its lines in CRLF
+  for (auto& l : v) {
+    if (!l.empty() && l.back() == '\r') l.pop_back();   // a Windows error log ends its lines in CRLF
+    l = strip_exe_names(l);                             // and names its server mariadbd.exe
+  }
   return v;
 }
 // the lines `while read` sees: a final line without a newline is dropped
@@ -952,6 +965,12 @@ string fts_dots(string s) {            // s/|/./g;s/\&/./g;s/:/./g;s|"|.|g;s|\!|
   for (char& c : s) if (c == '|' || c == '&' || c == ':' || c == '"' || c == '!' || c == '*' || c == ']' || c == '[' || c == ')' || c == '(') c = '.';
   return s;
 }
+// the same without | and :, which is all the script's main string pipeline turns into dots: the colon of a
+// Windows path, C:\test\..., stays a colon there
+string fts_dots_main(string s) {       // s|"|.|g;s|\!|.|g;s|&|.|g;s|\*|.|g;s|\]|.|g;s|\[|.|g;s|)|.|g;s|(|.|g
+  for (char& c : s) if (c == '&' || c == '"' || c == '!' || c == '*' || c == ']' || c == '[' || c == ')' || c == '(') c = '.';
+  return s;
+}
 string collapse_ws(const string& s) { return join(split_ws(s), " "); }   // an unquoted echo ${STRING}
 }  // namespace
 
@@ -1014,7 +1033,7 @@ string uid_fallback(const string& log_in, string* err) {
       s = r6.sub(s, "", false);
       s = replace_all(s, "DUMMY", " ");
       s = r7.sub(s, "", false);
-      s = fts_dots(s);
+      s = fts_dots_main(s);
       if (blank.hit(s)) continue;
       text = rtrim.sub(ltrim.sub(s, "", false), "", false);
       break;
@@ -1354,6 +1373,13 @@ string assert_from_logs(const vector<string>& logs) {
       if (w2.hit(l)) return w2.sub(l, "$1", false);
     }
   }
+  // A debug build aborts on a failed run-time check (/RTC1) from _RTC_StackFailure, _RTC_UninitUse and the like, which
+  // sit in the module that was compiled with it. The check that failed stands where an assertion's text does: it is the
+  // first _RTC_ frame, the ones after it are the check's own callers
+  RX(w3, "^[A-Za-z0-9_.+-]+!(_RTC_[A-Za-z0-9_]+)\\(\\).*$");
+  for (auto& lg : logs)
+    for (auto& l : grep_lines(read_file(lg)))
+      if (w3.hit(l)) return w3.sub(l, "$1", false);
   return "";
 }
 
@@ -1506,10 +1532,33 @@ string windows_signal(const string& code_in) {
   return "exception " + code;
 }
 
+// The names MSVC gives a frame where gdb names the same function otherwise. The compiler's deleting
+// destructor, X::`scalar deleting destructor', is gdb's second X::~X frame (the destructor of a Foo<int> is
+// Foo<int>::~Foo); the standard library's atomic storage, std::_Atomic_storage<T,N>, is libstdc++'s
+// std::__atomic_base<T>, the frame an atomic load or store fails in; an anonymous namespace is
+// `anonymous namespace' to MSVC and (anonymous namespace) to gdb. How a template argument is spelled is
+// not renamed here, since a 64 cannot be told from gdb's 64u: the known-bugs match reads both as one.
+static string windows_frame_name(string s) {
+  RX(dtor, "^(.+)::`(?:scalar|vector) deleting destructor'$");
+  RX(atomic, "^std::_Atomic_storage<(.+),[0-9]+>(::.+)$");
+  if (dtor.hit(s)) {
+    string cls = dtor.sub(s, "$1", false), bare;
+    int depth = 0;
+    for (char c : cls) { if (c == '<') depth++; else if (c == '>') { if (depth) depth--; } else if (!depth) bare += c; }
+    size_t p = bare.rfind("::");
+    s = cls + "::~" + (p == string::npos ? bare : bare.substr(p + 2));
+  } else if (atomic.hit(s)) {
+    s = atomic.sub(s, "std::__atomic_base<$1>$2", false);
+  }
+  return replace_all(s, "`anonymous namespace'", "(anonymous namespace)");
+}
+
 // A Windows server has no core and no gdb: it walks its own stack into the error log, one frame per
 // line as module!symbol()[file:line], from the faulting instruction down. The frames are read the way
 // frames_from_backtraces reads gdb's: the abort route and the CRT and OS modules go, as __GI_raise,
-// __GI_abort and __assert_fail go there, ??? is gdb's ?? (), and the do_command rule is the same.
+// __GI_abort and __assert_fail go there, ??? is gdb's ?? (), and the do_command rule is the same. The
+// abort route of a failed run-time check (failwithmessage, _RTC_*) goes too, and assert_from_logs names
+// the check instead. A frame is named as windows_frame_name gives it.
 // The first crash in the logs is the one read, as assert_from_logs reads the first assertion. ""
 // when the logs hold no such backtrace.
 string frames_from_windows_log(const vector<string>& logs, string* sig) {
@@ -1519,7 +1568,7 @@ string frames_from_windows_log(const vector<string>& logs, string* sig) {
   RX(frame, "^([A-Za-z0-9_.+-]+)!([^\r]*?)(?:\\(\\))?(?:\\[[^\\]]*\\])?\r?$");
   RX(blank, "^[ \t\r]*$");
   RXI(skip_mod, "^(ucrtbase|ucrtbased|vcruntime[0-9]*d?|msvcp[0-9]*d?|kernel32|kernelbase|ntdll)\\.dll$");
-  RX(skip_sym, "^(my_sigabrt_handler|my_parameter_handler|raise|abort|_wassert|_assert|common_assert_to_stderr.*|_invalid_parameter.*|_CrtDbgReport.*|_CrtDbgBreak|memmove|memcpy|\\?\\?\\?)$");
+  RX(skip_sym, "^(my_sigabrt_handler|my_parameter_handler|raise|abort|_wassert|_assert|common_assert_to_stderr.*|_invalid_parameter.*|_CrtDbgReport.*|_CrtDbgBreak|failwithmessage|_RTC_[A-Za-z0-9_]*|memmove|memcpy|\\?\\?\\?)$");
   vector<string> gdb4;
   for (auto& lg : logs) {
     vector<string> v = grep_lines(read_file(lg));
@@ -1537,7 +1586,7 @@ string frames_from_windows_log(const vector<string>& logs, string* sig) {
       begun = true;
       string mod = frame.sub(l, "$1", false), symb = frame.sub(l, "$2", false);
       if (skip_mod.hit(mod) || skip_sym.hit(symb) || symb.empty()) continue;
-      gdb4.push_back(symb);
+      gdb4.push_back(windows_frame_name(symb));
     }
     break;
   }
@@ -2104,11 +2153,26 @@ int cmd_parity(const Args& a) {
       printf("same %s %s: %s\n", trial.c_str(), tool.c_str(), co.c_str());
     }
   };
+  // The scripts only ever read a Linux server's log, which says mariadbd where a Windows server's says
+  // mariadbd.exe, and the port reads the name without its .exe (grep_lines). So the scripts get the same
+  // reading of such a log from a copy with s/mariadbd.exe/mariadbd/; every other log is read in place.
+  string copies = fmt("/tmp/omnium_parity_%d", (int)getpid());
+  sweep_stale_tmp("/tmp/omnium_parity_");
+  long n_copies = 0;
   for (auto& trial : trials) {
     string parent = dirname_of(trial), name = basename_of(trial);
     string log_rel = "./" + name + "/log/master.err";
+    string sh_parent = parent;                                 // where the scripts run
+    {
+      string raw = read_file(trial + "/log/master.err"), plain = strip_exe_names(raw);
+      if (plain != raw) {
+        sh_parent = copies + "/" + std::to_string(++n_copies);
+        mkdirs(sh_parent + "/" + name + "/log");
+        write_file(sh_parent + "/" + name + "/log/master.err", plain);
+      }
+    }
     for (auto mode : {"errors", "lastline", "top", "check", "clean", "aggregate"}) {
-      CmdResult b = run_capture({qa + "/error_log_scan.sh", mode, log_rel}, 600, parent);
+      CmdResult b = run_capture({qa + "/error_log_scan.sh", mode, log_rel}, 600, sh_parent);
       // run_capture merges both streams; a caller reads the script through $(...), which is stdout
       // alone. One grep in the script's chain has no --binary-files=text, so a log with a byte the
       // locale cannot decode makes it say so on stderr. That line is not part of the answer.
@@ -2130,7 +2194,7 @@ int cmd_parity(const Args& a) {
       compare(trial, string("els ") + mode, b, ok ? 0 : 1, out);
     }
     {
-      CmdResult b = run_capture({qa + "/fallback_text_string.sh", log_rel}, 600, parent);
+      CmdResult b = run_capture({qa + "/fallback_text_string.sh", log_rel}, 600, sh_parent);
       string err;
       string out = uid_fallback(trial + "/log/master.err", &err);
       // the script writes its asserts to stderr and run_capture merges both streams: only the
@@ -2142,7 +2206,7 @@ int cmd_parity(const Args& a) {
       compare(trial, "fts", bb, out.empty() ? 1 : 0, out);
     }
     {
-      CmdResult b = run_capture({qa + "/san_text_string.sh", log_rel}, 600, parent);
+      CmdResult b = run_capture({qa + "/san_text_string.sh", log_rel}, 600, sh_parent);
       vector<string> logs = {trial + "/log/master.err"};
       string err;
       string out = uid_san(capped_logs(logs), &err);
@@ -2158,6 +2222,10 @@ int cmd_parity(const Args& a) {
       bool ok = uid_for_dir(trial, r, o);
       compare(trial, "nts", b, ok ? 0 : 1, ok ? r.uid : r.err);
     }
+  }
+  if (n_copies) {
+    remove_tree(copies);
+    printf("(%ld logs say mariadbd.exe or mysqld.exe: the scripts were given them as mariadbd and mysqld, as the port reads them)\n", n_copies);
   }
   printf("=== %ld checks, %ld differences ===\n", checks, diffs);
   return diffs ? 1 : 0;

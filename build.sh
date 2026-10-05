@@ -211,12 +211,30 @@ if ! ninja -f "$NINJA" ${NINJA_ARGS:-} 2>&1 | grep -v '^ninja: Entering director
   echo "[build.sh] ninja failed (rc=${PIPESTATUS[0]})"; exit 1
 fi
 [ -f "$B/$OUT" ] || { echo "[build.sh] build failed" >&2; exit 1; }
-cp -f "$B/$OUT" "./$OUT.tmp" && mv -f "./$OUT.tmp" "./$OUT"
-echo "[build.sh] built: ./$OUT ($(stat -c %s "./$OUT") bytes)"
-echo "[build.sh] sanity: $(./$OUT --version 2>&1 | head -1)"
+cp -f "$B/$OUT" "./$OUT.tmp"
+BIN="./$OUT"
+if ! mv -f "./$OUT.tmp" "./$OUT" 2>/dev/null; then
+  # Windows will not overwrite an .exe that runs, but it would let one be renamed and another put in its place.
+  # That must not be done: under MSYS2 fork() starts the child from the parent's exe path, so a process whose
+  # exe was replaced can never fork again (a live run stalled with "cannot spawn a trial child"). So a busy
+  # exe waits a while for whatever runs it, and then stays: the new build is ./$OUT.new.
+  if [ "$WIN" = 1 ]; then
+    for i in 1 2 3 4 5 6 7 8 9 10; do sleep 1; mv -f "./$OUT.tmp" "./$OUT" 2>/dev/null && break; done
+    if [ -f "./$OUT.tmp" ]; then
+      mv -f "./$OUT.tmp" "./$OUT.new"
+      BIN="./$OUT.new"
+      echo "[build.sh] ./$OUT is in use and is not replaced (a process whose exe is replaced cannot fork any more under MSYS2): the build is $BIN" >&2
+    fi
+  else
+    mv -f "./$OUT.tmp" "./$OUT"                                 # the failure again, so that set -e reports it
+  fi
+fi
+[ "$BIN" = "./$OUT" ] && rm -f "./$OUT.new"                      # a new build took the name: the one that waited is of no more use
+echo "[build.sh] built: $BIN ($(stat -c %s "$BIN") bytes)"
+echo "[build.sh] sanity: $($BIN --version 2>&1 | head -1)"
 if [ "${SKIP_SELFTEST:-0}" != 1 ]; then
-  if ! ./"$OUT" --selftest; then
-    mv -f "./$OUT" "./$OUT.failed"
+  if ! "$BIN" --selftest; then
+    mv -f "$BIN" "./$OUT.failed"
     echo "[build.sh] selftest FAILED: kept as ./$OUT.failed" >&2
     exit 1
   fi

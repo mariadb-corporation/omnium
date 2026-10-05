@@ -124,7 +124,7 @@ void collect(View& v) {
   std::sort(d.begin(), d.end(), [](auto& a, auto& b) { return a.second > b.second; });
   if (d.size() > 5) d.resize(5);
   v.dups = d;
-  v.log = tail_of(v.dir + "/" + v.id + ".log", 60);
+  v.log = tail_of(v.dir + "/" + v.id + ".log", 400);   // enough for a tall terminal
   // the inbox items of this run
   v.inbox.clear();
   v.filed = 0;
@@ -195,7 +195,7 @@ string frame_text(const View& v, int rows, int cols, int log_lines, const string
     L.add(nullptr, v.id);
     L.add(nullptr, "  ");
     L.add(sc, state);
-    string right = "[q]uit [p]ause [P]resume [s]top [S]top-now [l/L]og [?]  ";
+    string right = "[q]uit [p]ause [r]esume [s]top [S]top-now [l/L]og [?]  ";
     string mid = "  up " + (v.started ? dur(now_s() - v.started) : string("-"));
     if (L.vis + mid.size() + right.size() + 2 < (size_t)inner) {
       L.add(C_DIM, mid);
@@ -222,9 +222,9 @@ string frame_text(const View& v, int rows, int cols, int log_lines, const string
     cell("shm", fmt("%d%%/%d%%", shm, g_cfg.shm_cap_pct), shm >= g_cfg.shm_cap_pct ? C_BAD : shm >= g_cfg.shm_cap_pct - 10 ? C_WARN : C_OK);
     push(L);
   }
-  // The lists share what the screen has left once the fixed lines, the log tail and the closing
-  // rule are taken off, so a small terminal is never overrun. A list that does not fit ends in a
-  // "+N more" line.
+  // The lists share what the screen has left once the fixed lines, the least the log gets and the
+  // closing rule are taken off, so a small terminal is never overrun. A list that does not fit ends
+  // in a "+N more" line. What the lists leave goes to the log, so the frame fills the screen.
   string jobs = kvget(v.kv, "jobs"), queue = kvget(v.kv, "queue");
   bool outcomes_any = false;
   for (auto& p : v.kv) if (starts_with(p.first, "outcome_")) outcomes_any = true;
@@ -243,6 +243,7 @@ string frame_text(const View& v, int rows, int cols, int log_lines, const string
   size_t cap_slots = take(v.slots.empty() ? 1 : v.slots.size(), room / 2, 1);
   size_t cap_inbox = take(v.inbox.size(), room / 2, 0);
   size_t cap_dups = take(v.dups.size(), room, 0);
+  log_n += std::max(0, room);   // the log takes the rows the lists left
   // builds
   rule("\xe2\x94\x9c", "\xe2\x94\xa4", "builds");
   if (v.builds.empty()) text_line(C_DIM, "none");
@@ -283,6 +284,8 @@ string frame_text(const View& v, int rows, int cols, int log_lines, const string
     const char* c = l.find("[WARN]") != string::npos ? C_WARN : l.find("saved-new") != string::npos ? C_NEW : C_DIM;
     text_line(c, l);
   }
+  // blank rows keep the pane at its height
+  for (size_t shown = v.log.size() - from; shown < n; shown++) text_line(nullptr, "");
   rule("\xe2\x94\x94", "\xe2\x94\x98", "");
   frame += "\033[J";
   if (!msg.empty()) frame += "\033[" + std::to_string(rows) + ";1H" + C_WARN + clip(msg, (size_t)cols) + C_RESET + "\033[K";
@@ -367,13 +370,13 @@ int cmd_tui(const Args& a) {
         auto say = [&](const string& m) { msg = m; msg_until = now_s() + 3; };
         if (c == 'q' || c == 3) { t.leave(); return 0; }
         else if (c == 'p') { ctl(v, "pause"); say("pause asked"); }
-        else if (c == 'P') { ctl(v, "resume"); say("resume asked"); }
+        else if (c == 'r' || c == 'P') { ctl(v, "resume"); say("resume asked"); }   // old key: P
         else if (c == 's') { ctl(v, "stop"); say("stop asked: the running trials finish first"); }
         else if (c == 'S') { ctl(v, "stop-now"); say("stop now asked"); }
         else if (c == 'l') { log_lines = std::min(40, log_lines + 4); }
         else if (c == 'L') { log_lines = std::max(2, log_lines - 4); }
-        else if (c == 'r') printf("\033[2J");
-        else if (c == '?') say("q quit; p pause; P resume; s stop after the running trials; S stop now; l/L more or less log; r redraw");
+        else if (c == 12) printf("\033[2J");   // Ctrl+L redraws
+        else if (c == '?') say("q quit; p pause; r resume; s stop after the running trials; S stop now; l/L more or less log; ^L redraw");
         break;
       }
       usleep(100000);

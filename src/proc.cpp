@@ -43,6 +43,9 @@ bool spawn_role(Child& c, const string& role, const vector<string>& args, const 
   string exe = g_exe_override.empty() ? self_exe() : g_exe_override;
   vector<string> argv = {exe, "--role", role};
   for (auto& a : args) argv.push_back(a);
+#ifdef OMNIUM_FORK_PLAN
+  ExecPlan plan = exec_plan(argv, {}, cwd, logfile);            // MSYS2: all the child needs, made here (see ExecPlan)
+#endif
   std::lock_guard<std::mutex> lk(g_spawn_mtx);
   pid_t pid = fork();
   if (pid < 0) { close(ev[0]); close(ev[1]); close(cmd[0]); close(cmd[1]); return false; }
@@ -54,6 +57,11 @@ bool spawn_role(Child& c, const string& role, const vector<string>& args, const 
     if (dup2(ev[1], 3) < 0 || dup2(cmd[0], 4) < 0) _exit(127);
     int devnull = open("/dev/null", O_RDONLY);
     if (devnull >= 0) { dup2(devnull, 0); if (devnull > 4) close(devnull); }
+#ifdef OMNIUM_FORK_PLAN
+    redirect_log(plan.log);
+    if (!plan.cwd.empty() && chdir(plan.cwd.c_str()) != 0) _exit(126);
+    exec_plan_run(plan);
+#else
     redirect_log(logfile);
     if (!cwd.empty() && chdir(cwd.c_str()) != 0) _exit(126);
     vector<char*> av;
@@ -61,6 +69,7 @@ bool spawn_role(Child& c, const string& role, const vector<string>& args, const 
     av.push_back(nullptr);
     execv(av[0], av.data());
     _exit(127);
+#endif
   }
   close(ev[1]);
   close(cmd[0]);
@@ -79,6 +88,9 @@ bool spawn_role(Child& c, const string& role, const vector<string>& args, const 
 pid_t spawn_program(const vector<string>& argv, const string& logfile, const string& cwd,
                     bool own_group, const vector<string>& env_add, bool die_with_us) {
   if (argv.empty()) return -1;
+#ifdef OMNIUM_FORK_PLAN
+  ExecPlan plan = exec_plan(argv, env_add, cwd, logfile);       // MSYS2: all the child needs, made here (see ExecPlan)
+#endif
   std::lock_guard<std::mutex> lk(g_spawn_mtx);
   pid_t pid = fork();
   if (pid < 0) return -1;
@@ -88,11 +100,18 @@ pid_t spawn_program(const vector<string>& argv, const string& logfile, const str
       if (getppid() == 1) _exit(127);
     }
     if (own_group) setpgid(0, 0);
+#ifdef __linux__
     // the framework's coredump_filter: anonymous and private file pages only, so a core holds the
     // stacks and the locals but not the buffer pool. Without it a core runs to tens of GB.
     { int f = open("/proc/self/coredump_filter", O_WRONLY); if (f >= 0) { ssize_t w = write(f, "0x11\n", 5); (void)w; close(f); } }
+#endif
     int devnull = open("/dev/null", O_RDONLY);
     if (devnull >= 0) { dup2(devnull, 0); if (devnull > 2) close(devnull); }
+#ifdef OMNIUM_FORK_PLAN
+    redirect_log(plan.log);
+    if (!plan.cwd.empty() && chdir(plan.cwd.c_str()) != 0) _exit(126);
+    exec_plan_run(plan);
+#else
     redirect_log(logfile);
     if (!cwd.empty() && chdir(cwd.c_str()) != 0) _exit(126);
     for (auto& e : env_add) putenv(strdup(e.c_str()));
@@ -102,6 +121,7 @@ pid_t spawn_program(const vector<string>& argv, const string& logfile, const str
     if (argv[0].find('/') != string::npos) execv(av[0], av.data());
     else execvp(av[0], av.data());
     _exit(127);
+#endif
   }
   return pid;
 }

@@ -351,9 +351,23 @@ static void index_disk(SqlSources& s) {
     for (auto& l : split_lines(read_file(fa))) if (!l.empty()) s.disk_a.push_back(l);
     return;
   }
-  string home = home_dir();
-  CmdResult p = run_shell("/usr/bin/find " + sh_quote(home) + " /*/SQL /*/TESTCASES -maxdepth 3 -name '*.sql' -type f 2>/dev/null | grep -vi newbugs_dups", 900);
-  CmdResult a = run_shell("/usr/bin/find / -maxdepth 5 -name '*.sql' -type f 2>/dev/null | grep -viE '/test/TESTCASES|newbugs_dups'", 1800);
+  // Under MSYS2 "/" is the MSYS2 install, not the disk: the person's folders are under the Windows profile and the drive is /c.
+  // And its /proc holds the Windows registry as folders, which `find /` walked for minutes at the start of every run, to find
+  // nothing. So there the all-disk set is looked for where the SQL is kept: the profile, the MSYS2 home, TEST_DIR and DATA_DIR,
+  // without AppData and the .git folders.
+  string home = user_home(), top = kHostMsys2 ? "/c" : "";
+  CmdResult p = run_shell("/usr/bin/find " + sh_quote(home) + " " + top + "/*/SQL " + top + "/*/TESTCASES -maxdepth 3 -name '*.sql' -type f 2>/dev/null | grep -vi newbugs_dups", 900);
+  const string drop = "grep -viE '/test/TESTCASES|newbugs_dups'";
+  string all = "/usr/bin/find / -maxdepth 5 -name '*.sql' -type f 2>/dev/null | " + drop;
+  if (kHostMsys2) {
+    vector<string> roots;
+    for (const string& d : {user_home(), home_dir(), g_cfg.test_dir, g_cfg.data_dir})
+      if (dir_exists(d) && std::find(roots.begin(), roots.end(), d) == roots.end()) roots.push_back(d);
+    string list;
+    for (auto& d : roots) list += " " + sh_quote(d);
+    all = roots.empty() ? "true" : "/usr/bin/find" + list + " -maxdepth 5 \\( -name AppData -o -name .git \\) -prune -o -name '*.sql' -type f -print 2>/dev/null | sort -u | " + drop;
+  }
+  CmdResult a = run_shell(all, 1800);
   for (auto& l : split_lines(p.out)) if (!l.empty()) s.disk_p.push_back(l);
   for (auto& l : split_lines(a.out)) if (!l.empty()) s.disk_a.push_back(l);
   write_file(fp, join(s.disk_p, "\n") + "\n");
@@ -440,6 +454,12 @@ static bool encryption_files(const string& trial_dir, const Basedir& b, vector<s
   if (sha2) { opts.push_back("--file_key_management_use_pbkdf2=11000"); opts.push_back("--file_key_management_digest=sha256"); }
   return true;
 }
+// ", see <log>" and the last lines of it (MSYS2: Linux keeps its shorter text until it is decided). The log goes with
+// the trial directory when the trial fails, so what the generator said is kept in the error that names it.
+static string log_note(const string& log) {
+  string t = trim(tail_lines(cap_text(read_file(log), 65536), 3));
+  return ", see " + log + (t.empty() ? "" : ": " + replace_all(t, "\n", " | "));
+}
 static bool run_generator(SqlSources& s, const string& out, size_t n, uint64_t seed, bool rocksdb, vector<string>& lines, string* err) {
   int threads = std::max(1, cpu_threads() / 4);
   string log = out + ".log";
@@ -448,7 +468,7 @@ static bool run_generator(SqlSources& s, const string& out, size_t n, uint64_t s
   if (pid <= 0) { if (err) *err = "cannot start the generator"; return false; }
   int st = wait_pid(pid, GEN_TIMEOUT_S * 1000);
   if (st == -1) { kill_group(pid, SIGKILL); wait_pid(pid, 5000); if (err) *err = "generator timed out"; return false; }
-  if (st != 0) { if (err) *err = fmt("generator rc %d, see %s", st, log.c_str()); return false; }
+  if (st != 0) { if (err) *err = kTakeFixes ? "generator " + wait_status_text(st) + log_note(log) : fmt("generator rc %d, see %s", st, log.c_str()); return false; }
   for (auto& l : split_lines(read_file(out))) {
     if (l.empty()) continue;
     string x = l;
@@ -472,7 +492,7 @@ static bool run_revgen(SqlSources& s, const string& out, size_t n, uint64_t seed
   if (pid <= 0) { if (err) *err = "cannot start revgen"; return false; }
   int st = wait_pid(pid, GEN_TIMEOUT_S * 1000);
   if (st == -1) { kill_group(pid, SIGKILL); wait_pid(pid, 5000); if (err) *err = "revgen timed out"; return false; }
-  if (st != 0) { if (err) *err = fmt("revgen rc %d, see %s", st, log.c_str()); return false; }
+  if (st != 0) { if (err) *err = kTakeFixes ? "revgen " + wait_status_text(st) + log_note(log) : fmt("revgen rc %d, see %s", st, log.c_str()); return false; }
   for (auto& l : split_lines(read_file(out))) if (!l.empty()) lines.push_back(l);
   unlink(out.c_str());
   unlink(log.c_str());

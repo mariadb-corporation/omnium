@@ -71,13 +71,27 @@ bool table_checksums(const Endpoint& ep, std::map<string, string>& out, std::map
 }
 
 bool log_has_san_marker(const string& log) { return text_has_san_marker(read_file(log)); }
+}  // namespace
 // the SQL of a trial can lock root out: a changed or expired password, a revoked privilege, a broken
 // init_connect, every connection taken. That is a configured state, not a backup finding, so the round
 // trip of such a trial is skipped.
 bool root_turned_away(const string& text) {
   return icontains(text, "Access denied") || icontains(text, "Failed to connect") || icontains(text, "SET PASSWORD") ||
-         icontains(text, "init_connect") || icontains(text, "Too many connections");
+         icontains(text, "init_connect") || icontains(text, "Too many connections") ||
+         (kTakeFixes && icontains(text, "is not allowed to connect"));                 // error 1130: the user's host was taken away
 }
+// An encrypted backup (the server ran with the file key management plugin) is prepared with the backup's own
+// backup-my.cnf, which holds the key plugin and its files: --no-defaults leaves them out, and srv_start() then
+// ends 11. The backup tool does not take the plugin options on its command line ("unknown variable").
+bool backup_is_encrypted(const vector<string>& myextra) {
+  for (auto& o : myextra) {
+    string k = lower(o.substr(0, o.find('=')));
+    for (char& c : k) if (c == '_') c = '-';
+    if (starts_with(k, "--file-key-management") || (k == "--plugin-load-add" && icontains(o, "file_key_management"))) return true;
+  }
+  return false;
+}
+namespace {
 bool uid_known(const string& uid) {
   if (uid.empty()) return false;
   KbVerdict v = kb_verdict(kb_search(uid));
@@ -109,8 +123,13 @@ vector<string> with_conn(vector<string> head, const Instance& inst, const vector
 }
 }  // namespace
 // the handy start/stop/cl helpers of a saved trial, plus the gdb note when a core is there
-void write_helpers(const string& tdir, const Basedir& b, const Instance& inst, const string& myextra, bool core) {
-  string mysafe = mysafe_options(b);
+void write_helpers(const string& tdir, const Basedir& b, const Instance& inst, const string& myextra_in, bool core) {
+  string mysafe = mysafe_options(b), myextra = myextra_in;
+  if (b.windows) {                                              // as Instance::argv() does: a FILE:/path reaches a native server only when it is native
+    vector<string> w;
+    for (auto& o : split_ws(myextra_in)) w.push_back(native_option(o));
+    myextra = join(w, " ");
+  }
   string conn = inst.tcp ? " " + join(endpoint_args(inst.endpoint()), " ") : " -S$PWD/socket.sock";
   string start = "#!/bin/bash\n# Starts this trial's server on its saved datadir\ncd \"$(dirname \"$(readlink -f \"$0\")\")\"\nrm -f socket.sock pid.pid\n" +
                  sh(b.bin) + " " + mysafe + " " + myextra + " --basedir=" + sh(b.path) +
@@ -291,7 +310,7 @@ int role_trial(const Args& a) {
   string base_ev = fmt("trial=%ld area=%s mode=%s threads=%d", trial, area->name.c_str(), mode.c_str(), threads);
   if (!started) {
     string log = read_file(inst.errlog);
-    bool core = inst.has_core();
+    bool core = inst.has_core() || inst.has_dump();
     if (!core) {
       inst.kill_hard();
       remove_tree(inst.datadir);                                  // the copy of the template says nothing
@@ -362,6 +381,8 @@ int role_trial(const Args& a) {
       append_file(inst.errlog, "omnium: crash recovery test: the server was killed with SIGKILL and is started again on the same datadir\n");
       unlink(inst.sock.c_str());
       if (!inst.start_only(start_timeout)) {
+        // the server recovered and the trial's own SQL had turned root away: a configured state, not a recovery failure
+        if (kTakeFixes && root_turned_away(inst.start_note)) { logline("trial %ld: crash recovery: the server turns root away, %s", trial, inst.start_note.c_str()); break; }
         recovery_failed = true;
         write_file(tdir + "/CRASH_RECOVERY_ISSUE", inst.start_note + "\n");
         break;
@@ -404,7 +425,8 @@ int role_trial(const Args& a) {
       return false;
     };
     auto step = [&](const string& what, const vector<string>& args) {
-      vector<string> argv = {b.backup, "--no-defaults"};
+      vector<string> argv = {b.backup};
+      if (args.empty() || !starts_with(args[0], "--defaults-file=")) argv.push_back("--no-defaults");   // a step may name the file it reads
       argv.insert(argv.end(), args.begin(), args.end());
       mkdirs(bk_cwd);
       CmdResult r = run_capture(argv, BACKUP_STEP_TIMEOUT_S, bk_cwd);
@@ -422,8 +444,14 @@ int role_trial(const Args& a) {
     std::map<string, string> orig, rest, engine;
     if (ok && !table_checksums(inst.endpoint(), orig, engine, &why)) { skip = "checksums on the server: " + why; ok = false; }
     if (ok) ok = step("the incremental backup", with_conn({"--backup", "--user=root"}, inst, {"--target-dir=" + inc, "--incremental-basedir=" + full}));
-    if (ok) ok = step("prepare of the full backup", {"--prepare", "--target-dir=" + full});
-    if (ok) ok = step("prepare of the incremental backup", {"--prepare", "--target-dir=" + full, "--incremental-dir=" + inc});
+    vector<string> prep_full = {"--prepare", "--target-dir=" + full}, prep_inc = {"--prepare", "--target-dir=" + full, "--incremental-dir=" + inc};
+    if (kTakeFixes && backup_is_encrypted(t.myextra)) {          // the backup's own backup-my.cnf has the key plugin and its files
+      string cnf = "--defaults-file=" + full + "/backup-my.cnf";
+      prep_full.insert(prep_full.begin(), cnf);
+      prep_inc.insert(prep_inc.begin(), cnf);
+    }
+    if (ok) ok = step("prepare of the full backup", prep_full);
+    if (ok) ok = step("prepare of the incremental backup", prep_inc);
     if (ok) {
       // the prepared backup is a datadir: a server starts on it with the trial's own options
       ri.bd = &b;
@@ -464,7 +492,7 @@ int role_trial(const Args& a) {
     }
     if (!ri.shutdown(SHUTDOWN_SECONDS) && ok) { why = fmt("the server on the restored data did not stop within %d s", SHUTDOWN_SECONDS); backup_uid = backup_issue_uid("the server on the restored data did not stop", ""); ok = false; }
     ri.kill_hard();
-    if (ri.has_core() && ok) { why = "the server on the restored data crashed; its core and log are under restore/"; ok = false; }
+    if ((ri.has_core() || ri.has_dump()) && ok) { why = "the server on the restored data crashed; its core and log are under restore/"; ok = false; }
     if (ok) logline("trial %ld: backup round trip: %zu tables match after the full and incremental backups, prepare and a start on the result", trial, orig.size());
     else if (!skip.empty()) logline("trial %ld: backup round trip skipped, %s", trial, skip.c_str());
     else { backup_issue = true; write_file(tdir + "/BACKUP_ISSUE", why + "\n"); logline("trial %ld: backup round trip issue, %s", trial, why.substr(0, why.find('\n')).c_str()); }
@@ -485,8 +513,8 @@ int role_trial(const Args& a) {
     string snote;
     bool gone = inst.shutdown(SHUTDOWN_SECONDS, &snote);
     if (!gone) {
-      for (int i = 0; i < 5 && !inst.has_core(); i++) sleep(1);
-      if (!inst.has_core()) {
+      for (int i = 0; i < 5 && !inst.has_core() && !inst.has_dump(); i++) sleep(1);
+      if (!inst.has_core() && !inst.has_dump()) {
         shutdown_hang = true;
         write_file(tdir + "/SHUTDOWN_TIMEOUT_ISSUE",
                    fmt("the server did not stop within %d seconds; %s\n", SHUTDOWN_SECONDS, snote.c_str()));
@@ -548,9 +576,10 @@ int role_trial(const Args& a) {
   if (large) write_file(tdir + "/LARGE_ERROR_LOG_ISSUE", "");
   // the UniqueID and the decision
   bool have_core = inst.has_core();
+  bool crashed = have_core || inst.has_dump();                  // a Windows server leaves a minidump and the frames in its log: that crash is the bug
   string fallback = uid_fallback(inst.errlog, nullptr);
   string uid, outcome;
-  if (have_core || !fallback.empty() || san) {
+  if (crashed || !fallback.empty() || san) {
     UidResult ur;
     UidOptions uo;
     uo.wait_core = true;
@@ -563,6 +592,20 @@ int role_trial(const Args& a) {
       if (uid_known(uid) && !file_exists(tdir + "/ERROR_LOG_SCAN_ISSUE")) outcome = "known";
       else { save = true; outcome = "saved-new"; }
     }
+  } else if (inst.silent_death()) {
+    // a Windows release server that died with no banner and no minidump: its exit status is the UID, as the frames are a crash's
+    uid = inst.silent_death_uid();
+    write_file(tdir + "/MYBUG", uid + "\n");
+    if (uid_known(uid) && !file_exists(tdir + "/ERROR_LOG_SCAN_ISSUE")) outcome = "known";
+    else { save = true; outcome = "saved-new"; }
+  } else if (kTakeFixes && file_exists(tdir + "/ERROR_LOG_SCAN_ISSUE")) {
+    // a flagged log line and no crash: the UID is what omnium t says, so that MYBUG and t agree (the scan's own pick of
+    // a line can differ from the chain's); the scan's UID stays when the chain has none
+    UidResult ur;
+    UidOptions uo;
+    uo.wait_core = false;
+    uid_for_dir(tdir, ur, uo);
+    if (!ur.uid.empty() && !starts_with(ur.uid, "Assert:")) { uid = ur.uid; write_file(tdir + "/MYBUG", uid + "\n"); }
   } else if (read_file(inst.errlog).find("SIGKILL myself") != string::npos) {
     save = true; outcome = "saved-sigkill";
   } else if (cr.gone_away >= GONE_AWAY_SAVE && !timeout_reached && server_died) {
@@ -573,7 +616,7 @@ int role_trial(const Args& a) {
   // backup trials: a crash of the server on the restored data has its core and log in the trial's layout
   // under restore/; any other issue carries its own UID, so the known list and the per-UID cap apply to it too
   if (backup_issue && uid.empty() && !save) {
-    if (ri.has_core()) {
+    if (ri.has_core() || ri.has_dump()) {
       UidResult ur;
       UidOptions uo;
       uo.wait_core = true;

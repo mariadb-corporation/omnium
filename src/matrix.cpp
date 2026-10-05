@@ -5,6 +5,7 @@
 // order through the in-process client, then the UID chain on the error log and the core. A row
 // reads "No bug found" when the chain finds nothing, as findbug's line script does.
 #include "verbs.h"
+#include <regex>
 #include <sys/wait.h>
 
 namespace {
@@ -43,14 +44,16 @@ void sweep_one(const string& sql_file, size_t statements, const string& options,
   mkdirs(root);
   write_file(root + "/BASEDIR", b.path + "\n");
   for (auto& o : split_ws(options)) inst.extra.push_back(o);
-  string tpl = template_for(b, "", templates);
+  string tpl = template_for(b, myinit_from(options), templates);   // the page size of the testcase's header goes into the template too
   if (tpl.empty()) { row.note = "no datadir template"; row.uid = "No result (datadir init failed)"; return; }
   if (!inst.start_fresh(tpl, san ? 240 : 60)) {
     row.note = "server did not start: " + inst.start_note;
     // a start failure under the testcase's options is still an observation of the log
     UidResult r; UidOptions o; o.wait_core = false;
     uid_for_dir(root, r, o);
-    row.uid = r.uid.empty() || starts_with(r.uid, "Assert:") ? "No result (server did not start)" : r.uid;
+    // a crash at startup is an observation; the noise of a server that is up but was never reached (aborted connections) is not
+    static const std::regex weak("^(INNODB_WARNING|SLAVE_WARNING|WARNING_ABORTED|WARNING|INNODB_NOTE|UNTYPED)\\|");
+    row.uid = r.uid.empty() || starts_with(r.uid, "Assert:") || (kTakeFixes && std::regex_search(r.uid, weak)) ? "No result (server did not start)" : r.uid;
     inst.kill_hard();
     return;
   }
@@ -92,8 +95,8 @@ void sweep_one(const string& sql_file, size_t statements, const string& options,
   sleep(san ? 5 : 2);
   if (!timed_out && inst.alive() && !inst.shutdown(SHUTDOWN_SECONDS)) {
     // the framework waits a moment for a shutdown core before it kills
-    for (int i = 0; i < 5 && !inst.has_core(); i++) sleep(1);
-    if (!inst.has_core()) row.note = "shutdown did not finish in time";
+    for (int i = 0; i < 5 && !inst.has_core() && !inst.has_dump(); i++) sleep(1);
+    if (!inst.has_core() && !inst.has_dump()) row.note = "shutdown did not finish in time";
   }
   inst.kill_hard();
   UidResult r; UidOptions o; o.wait_core = false;
@@ -101,9 +104,13 @@ void sweep_one(const string& sql_file, size_t statements, const string& options,
   string uid = trim(r.uid);
   if (uid.empty() || starts_with(uid, "Assert:")) uid = "No bug found";
   if (uid.find("MARIADBD_ERROR|mariadbd: caching_sha2_password: failed to read private_key.pem: 2") != string::npos) uid = "No bug found";
+  // a Windows release server can die with no banner in its log and no minidump (a failed /GS stack cookie check, a
+  // __fastfail): the way it ended is all there is, and "No bug found" would hide a crash
+  bool silent = uid == "No bug found" && inst.silent_death();
+  if (silent) { uid = inst.silent_death_uid(); row.note = "the server ended on its own with no crash banner and no minidump"; }
   if (timed_out && uid == "No bug found") uid = "No result (hang: the client timed out)";
   row.uid = uid;
-  row.crashed = inst.has_core() || r.san;
+  row.crashed = inst.has_core() || inst.has_dump() || silent || r.san;
   row.san = r.san;
   if (row.crashed || (uid != "No bug found" && !starts_with(uid, "No result"))) {
     row.stack = stack_text(root, basedir_banner_title(b), &err);

@@ -444,6 +444,9 @@ int cmd_build(const Args& a) {
   string dir, err;
   if (dir_exists(what)) dir = abs_path(what);
   else {
+    // MSYS2: a branch name never starts with a slash or has a drive letter, so this is a path that is not there: cloned as
+    // a branch, it would only leave its parent folders under TEST_DIR (Linux keeps its behaviour until it is decided)
+    if (kTakeFixes && (what[0] == '/' || (what.size() > 1 && what[1] == ':'))) { printf("omnium build: %s is not a directory\n", what.c_str()); return 1; }
     dir = g_cfg.test_dir + "/" + (vendor == Vendor::MySQL ? "mysql-" : vendor == Vendor::Percona ? "percona-" : "") + what + ((es && version_like(what)) ? "-es" : "");
     if (!dir_exists(dir) && !clone_source(what, vendor, es, dir, &err)) { printf("%s\n", err.c_str()); return 1; }
   }

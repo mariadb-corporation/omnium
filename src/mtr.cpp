@@ -167,7 +167,7 @@ void replay(const Basedir& b, const vector<string>& stmts, const vector<string>&
   mkdirs(root);
   write_file(root + "/BASEDIR", b.path + "\n");
   for (auto& o : server_opts) inst.extra.push_back(o);
-  string tpl = template_for(b, "", templates);
+  string tpl = template_for(b, myinit_from(join(server_opts, " ")), templates);
   if (tpl.empty()) { r.note = "no datadir template"; return; }
   if (!inst.start_fresh(tpl, b.is_san() ? 240 : 60)) { r.note = "server did not start: " + inst.start_note; inst.kill_hard(); return; }
   MYSQL* m = mysql_init(nullptr);
@@ -197,14 +197,14 @@ void replay(const Basedir& b, const vector<string>& stmts, const vector<string>&
   mysql_close(m);
   sleep(b.is_san() ? 3 : 1);
   if (r.crash_at < 0 && inst.alive()) {
-    if (!inst.shutdown(25)) for (int i = 0; i < 5 && !inst.has_core(); i++) sleep(1);
+    if (!inst.shutdown(25)) for (int i = 0; i < 5 && !inst.has_core() && !inst.has_dump(); i++) sleep(1);
   }
   inst.kill_hard();
   UidResult ur; UidOptions uo; uo.wait_core = false;
   uid_for_dir(root, ur, uo);
   r.uid = trim(ur.uid);
   if (starts_with(r.uid, "Assert:")) r.uid.clear();
-  if (r.crash_at < 0 && (inst.has_core() || (!r.uid.empty() && ur.san))) r.shutdown_crash = inst.has_core();
+  if (r.crash_at < 0 && (inst.has_core() || inst.has_dump() || (!r.uid.empty() && ur.san))) r.shutdown_crash = inst.has_core() || inst.has_dump();
 }
 // a statement's own error, the kind a --error line names: the server's codes, not the client's 2000-2999
 bool server_error(int e) { return e > 0 && (e < 2000 || e >= 3000); }
@@ -447,14 +447,51 @@ void mtr_parse_verdict(const string& out, int rc, const string& test_name, bool 
   v.reason = join(why, "\n");
 }
 
+static bool perl_is_native(const string& perl) {
+  if (!is_executable(perl)) return false;
+  CmdResult r = run_capture({perl, "-e", "print $^O"}, 20);
+  return r.rc == 0 && trim(r.out) == "MSWin32";
+}
+string native_perl_find(string* why) {
+  string tried;
+  auto ok = [&](const string& p) {
+    if (perl_is_native(p)) return true;
+    if (is_executable(p)) tried += (tried.empty() ? "" : ", ") + p + " (not native)";
+    return false;
+  };
+  if (!g_cfg.perl.empty()) {
+    if (ok(g_cfg.perl)) return g_cfg.perl;
+    if (why) *why = "PERL=" + g_cfg.perl + " is " + (is_executable(g_cfg.perl) ? "not a native Windows perl (it says $^O is not MSWin32)" : "not there") + ": MTR needs a native Windows perl, such as Strawberry Perl";
+    return "";
+  }
+  vector<string> cands = {"/c/Strawberry/perl/bin/perl.exe", "/c/Perl64/bin/perl.exe", "/c/Perl/bin/perl.exe"};
+  string wh = windows_home();
+  if (!wh.empty()) cands.push_back(wh + "/tools/strawberry-perl/perl/bin/perl.exe");
+  if (const char* path = getenv("PATH")) for (auto& d : split(path, ':')) if (!d.empty()) cands.push_back(d + "/perl.exe");
+  for (auto& c : cands) if (ok(c)) return c;
+  if (why)
+    *why = "MTR on Windows needs a native Windows perl, and there is none" + (tried.empty() ? string() : " (" + tried + ")") +
+           ": MSYS2's perl reports $^O=msys, which MTR takes for Cygwin and then asks for --cygwin-subshell-fix=do, a wrapper over /bin/sh "
+           "that omnium runs on, so never use that flag. Install Strawberry Perl (the portable zip needs no admin rights) into C:\\Strawberry or "
+           "%USERPROFILE%\\tools\\strawberry-perl, or set PERL=<its perl.exe> (docs/windows.md)";
+  return "";
+}
+
 // runs the test from the build's mariadb-test tree; true = the run happened (verdict tells the outcome)
 bool mtr_verify(const Basedir& b, MtrTest& t, const string& tag, MtrVerdict& v, string* err) {
   v = MtrVerdict();
   v.build = b.name;
   string mt = basedir_test_dir(b);
-  if (mt.empty()) { if (err) *err = "no mariadb-test or mysql-test dir in " + b.path; return false; }
+  if (mt.empty()) { if (err) *err = b.windows ? "no mariadb-test in " + b.path + ": " + mtr_suite_fix() : "no mariadb-test or mysql-test dir in " + b.path; return false; }
   string runner = file_exists(mt + "/mariadb-test-run.pl") ? "./mariadb-test-run.pl" : "./mysql-test-run.pl";
   if (!file_exists(mt + "/" + runner.substr(2))) { if (err) *err = "no test runner in " + mt; return false; }
+  string perl = "perl";
+  vector<string> perl_env;
+  if (b.windows) {                                              // a native perl, first on the PATH the runner and its helpers see
+    perl = native_perl_find(err);
+    if (perl.empty()) return false;
+    perl_env.push_back("PATH=" + dirname_of(perl) + ":" + (getenv("PATH") ? getenv("PATH") : "/usr/bin:/bin"));
+  }
   // a run killed between the install below and the removal at the end leaves its files in the
   // build's test dir; the longest verify is two runs of 1800 s, so an older file is such a leftover
   {
@@ -474,10 +511,11 @@ bool mtr_verify(const Basedir& b, MtrTest& t, const string& tag, MtrVerdict& v, 
   spawn_role(hold, "hold", {vardir}, "/dev/null");
   write_file(test_path, t.test);
   if (!t.opt.empty()) write_file(opt_path, t.opt); else fs::remove(opt_path);
-  vector<string> argv = {"perl", runner, "--vardir=" + vardir + "/var", "--tmpdir=" + vardir + "/tmp", "--parallel=1", "--retry=0",
+  vector<string> argv = {perl, runner, "--vardir=" + vardir + "/var", "--tmpdir=" + vardir + "/tmp", "--parallel=1", "--retry=0",
                          "--force", "--testcase-timeout=20", "main." + name};
   if (t.debug_only && !b.dbg) { v.verdict = "skipped: the test needs a debug build"; fs::remove(test_path); fs::remove(opt_path); kill_group(hold.pid, SIGKILL); child_reap(hold, 2000); remove_tree(vardir); return true; }
   vector<string> env = san_env_for(b);
+  for (auto& e : perl_env) env.push_back(e);
   env.push_back("MTR_MAX_SAVE_CORE=0");
   env.push_back("MTR_MAX_SAVE_DATADIR=0");
   CmdResult r = run_capture(argv, 1800, mt, env);

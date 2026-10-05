@@ -71,7 +71,7 @@ int cmd_fresh(const Args& a) {
   inst.set_paths(root, datadir);
   for (auto& o : split_ws(options)) inst.extra.push_back(o);
   write_file(root + "/BASEDIR", b.path + "\n");
-  string tpl = template_for(b, "", root + "/templates");
+  string tpl = template_for(b, myinit_from(options), root + "/templates");
   if (tpl.empty()) { fprintf(stderr, "omnium fresh: no datadir template for %s\n", b.name.c_str()); return 1; }
   if (!inst.start_fresh(tpl, b.is_san() ? 240 : 90)) {
     fprintf(stderr, "omnium fresh: %s\n", inst.start_note.c_str());
