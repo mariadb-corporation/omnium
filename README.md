@@ -171,15 +171,8 @@ be security issues and go by hand. At most ten tickets are filed a day.
 ## Documentation
 
 `README.md` is what omnium is and how to drive it. `docs/` holds one file per subject that needs
-more than a paragraph: what the tool does now and why, never a record of how it got there.
+more than a paragraph: what the tool does and why, never a record of how it got there.
 `docs/framework_files.md` lists what omnium reads from the mariadb-qa checkout and why this repo
 keeps no copy. `docs/core_placement.md` covers where a trial's core file lands.
 `docs/sanitizer_builds.md` covers the sanitizer builds and what each one can prove here.
 `docs/windows.md` covers the Windows side.
-
-## Not yet in omnium
-
-Filter proposals, Valgrind and query-correctness reductions, an MTR-based
-matrix, the reducer's last stage on the MTR form, and the replication and multi-connection MTR forms.
-The reducer is the framework's, embedded: it starts its subreducers as processes and still calls
-`new_text_string.sh` for its UID checks.

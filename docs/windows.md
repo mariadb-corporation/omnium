@@ -109,8 +109,6 @@ that path turned to slashes, so the same line gives the same UID on both boxes.
 - `omnium stack`, `omnium ldd` and the copy of the server binary beside a saved trial read ELF
   files with gdb and `ldd`. A Windows trial keeps its error log, the frames in it and the
   minidump; the copy step logs a note and moves on.
-- `omnium mtr` drives `mysql-test-run.pl` in the basedir. It has not been run under MSYS2's perl
-  against a Windows build yet.
 - `PR_SET_PDEATHSIG`, a child dying with its parent, has no Windows equivalent. A child is still
   killed with its process group on a stop, so the effect is the same on a clean stop and differs
   only when omnium itself is killed with SIGKILL.
@@ -120,12 +118,3 @@ that path turned to slashes, so the same line gives the same UID on both boxes.
 - `screen` is not on Windows. `omnium reduce --screen` needs it; `omnium reduce` without it works.
 - The compiler line in the report banner comes from `readelf`; a Windows build's banner has the
   version and the revision without it.
-
-## Not yet checked on a Windows box
-
-These follow from the MSYS2 documentation and have not been run against a real Windows build yet:
-the omnium build itself under `build_windows.bat`; the probe finding `bin\mariadbd.exe` when asked
-for `bin/mariadbd` (MSYS2 resolves the `.exe`); the conversion of `--datadir=/c/test/...` to a
-native path when `mariadb-install-db.exe` and `mariadbd.exe` are started; the encryption area's
-`--file-key-management-filekey=FILE:/c/...` option, which the same conversion may read as a path
-list; and the minidump, which omnium keeps with the datadir but does not read.

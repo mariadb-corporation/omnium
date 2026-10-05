@@ -12,6 +12,7 @@
 *.profdata
 core
 core.*
+*.swp
 *.core
 handoff_*.md
 handover_*.md
