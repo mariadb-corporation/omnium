@@ -6,8 +6,9 @@ server builds under `C:\test`. This file covers what differs from Linux.
 ## Build
 
 `build_windows.bat [release|debug|clean]` finds MSYS2, checks the packages the build and the runs
-need (`openssl`, `xz`, `findutils` and `perl` are the ones the trials call) and runs
-`./build.sh` in an MSYS2 shell. The result is `omnium.exe` beside the sources. Run it from an MSYS2
+need (`openssl`, `xz`, `findutils` and `perl` are the ones the trials call; `cmake`, `openssl-devel`
+and `zlib-devel` are for the client library below) and runs `./build.sh` in an MSYS2 shell, started
+in the folder of the script. The result is `omnium.exe` beside the sources. Run it from an MSYS2
 shell, or with `C:\msys64\usr\bin` on `PATH`, since that is where its runtime DLLs live.
 
 omnium is written against POSIX: it forks and execs child processes, keeps a control pipe on fd 3
@@ -16,10 +17,30 @@ build uses the MSYS2 packages, not the mingw ones. Under MSYS2 `build.sh` differ
 
 - The compiler is `clang++` when the box has it, else `g++`, with the default C++ library and
   linker. There is no rpath and no build-id on a Windows binary.
-- The client library is the MSYS2 `libmariadbclient-devel` package, `-lmariadb` with the headers
-  under `/usr/include/mysql`. It is built with the same runtime as omnium. The basedirs carry an
-  MSVC `mariadbclient.lib` and `libmariadb.dll`, which is not a mix to link into an MSYS2 binary.
-- `-ldw -lelf -ldl -lresolv` are Linux libraries and are left out.
+- The client library is MariaDB Connector/C, built from source for the MSYS2 runtime. MSYS2 has no
+  package for it under that runtime (its mingw packages are built against another one), and the
+  basedirs carry an MSVC `mariadbclient.lib` and `libmariadb.dll`, which is not a mix to link into
+  an MSYS2 binary. When `/usr/local/include/mysql/mysql.h` is missing, `build.sh` runs
+  `connector_windows.sh`: it clones the pinned release (`CONNECTOR_TAG`) into `build/connector-src`,
+  builds it with cmake and installs it into `/usr/local`. `MARIADB_BASEDIR=` names another prefix.
+  omnium links the static `libmariadbclient.a` as on Linux, with `-lssl -lcrypto -lz`.
+- `-ldw -lelf -lresolv` are Linux libraries and are left out; the runtime has `dlopen` itself.
+- `-D_GNU_SOURCE` is added, which the compilers define on their own on Linux: without it
+  `-std=c++20` hides `usleep`, `kill`, `setenv`, `pipe2`, `u_char`, the pty calls and more in the
+  MSYS2 headers.
+- The generator, revgen and reducer of the mariadb-qa checkout are linked as compiled. On Linux
+  `objcopy` makes every symbol of theirs local. On a COFF object that also turns the COMDAT leaders
+  (the std templates they instantiate, and the `.refptr.*` stubs) into static symbols, the linker
+  stops folding them with the other objects', and the first static initializer runs on an
+  unrelocated `.refptr.__dso_handle` and crashes. What they define with external linkage besides
+  the entry point is only COMDATs, with one exception: their global `Xoshiro256pp` has the name of
+  omnium's own (`common.h`), so it is renamed with a `-D` on their compiles. `src/msys2/sys/auxv.h`
+  stands in for the Linux header they include to seed their random generator.
+- The entry points are weak references, and a PE link has no undefined weak symbols, so the one a
+  `NO_GENERATOR=1` or `NO_REDUCER=1` build leaves out is defined as 0, which reads as absent.
+- The C++ library is libstdc++, not libc++, and its `file_time_type` has an epoch of its own (2174),
+  so `fs::last_write_time(...).time_since_epoch()` is not Unix time. The code takes file times from
+  `file_mtime()`, or subtracts two clocks as `inbox.cpp` does.
 - The sanitizer modes (`ubasan`, `msan`, `tsan`) and `coverage` are not available.
 
 ## Where things live
@@ -31,6 +52,18 @@ build.
 The checkout does not go in `C:\test\omnium`: that is omnium's own queue directory,
 `<TEST_DIR>/omnium`, beside the registry `<TEST_DIR>/omnium.builds`. The repo goes in the home
 folder or in `C:\omnium`, as on Linux it sits in the home folder beside `/test/omnium`.
+
+The settings file `~/.omnium.conf` and the shell files (`~/.omnium_aliases`, `~/.bashrc`) are in the
+MSYS2 home, `C:\msys64\home\<you>`, because the shell reads them there. The Jira token is not: the
+MSYS2 home is a folder of the shared MSYS2 install, so the token defaults to `~/.omnium_jira_pat` in
+the Windows profile, `C:\Users\<you>`, which MSYS2 names `/c/Users/<you>`. Only MSYS2's own home is
+replaced that way: a `HOME` set to anything else is the home, which is how the selftest keeps the
+omniums it starts away from the real token. `PAT_FILE` names another file.
+
+A Windows file is protected by its ACL, which `umask` does not set, and MSYS2 mounts ignore ACLs,
+so `ls -l` shows 644 whatever the ACL says. When it finds no token, `omnium init` prints the line
+that keeps the file to one account:
+`icacls "$(cygpath -w FILE)" /inheritance:r /grant:r "$USERNAME:F"`.
 
 ## How a client reaches the server
 
@@ -118,3 +151,24 @@ that path turned to slashes, so the same line gives the same UID on both boxes.
 - `screen` is not on Windows. `omnium reduce --screen` needs it; `omnium reduce` without it works.
 - The compiler line in the report banner comes from `readelf`; a Windows build's banner has the
   version and the revision without it.
+
+## The selftest
+
+`omnium selftest` runs under MSYS2 and, as on any box, names the checks it cannot run under the
+summary as skipped:
+
+- `cmake_command`: `omnium build` is not ported.
+- The out-of-memory score of a child: `/proc/<pid>/oom_score_adj` is the Linux kernel's.
+- A BASEDIR file pointing the chain at a build: the chain takes ELF server binaries, and a Windows
+  server is a PE file.
+- A holder started through a link: MSYS2's `/proc/<pid>/exe` names the path a process was started
+  by, not the binary behind a link, so a second omnium cannot tell such a run from another program
+  by its binary. A run started as `omnium.exe` shows omnium in its command line and is told.
+- `mount_point_of` on `/proc/self`: `/proc/<pid>` is on a device of its own.
+- The shell scan on a log line with a byte the locale cannot read: the grep 3.0 of MSYS2 prints its
+  note on stdout, so the script answers `UNTYPED` where the check describes grep 3.5 and later.
+- A stopped run picked up again, on a box with no build under `TEST_DIR`.
+
+The Jira checks talk to a stand-in Jira that takes any token, so they run with a stand-in one on
+every box and the real token never leaves its file. A box without a token gets a "Jira PAT missing"
+note under the summary: only a real search or filing needs one.

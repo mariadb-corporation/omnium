@@ -13,7 +13,7 @@ static vector<Key>& keys() {
   static vector<Key> k = {
     {"EMAIL", "address that gets one mail per new inbox item; empty = none",
      [] { return g_cfg.email; }, [](const string& v) { g_cfg.email = v; return true; }},
-    {"PAT_FILE", "Jira personal access token file (the same file ~/jira uses)",
+    {"PAT_FILE", "Jira personal access token file (~/.omnium_jira_pat, else the file ~/jira reads)",
      [] { return g_cfg.pat_file; }, [](const string& v) { g_cfg.pat_file = v; return true; }},
     {"JIRA_URL", "the Jira the filing talks to",
      [] { return g_cfg.jira_url; }, [](const string& v) { g_cfg.jira_url = v; return true; }},
@@ -198,7 +198,7 @@ static string default_qa_dir() {
 }
 void config_load(bool write_defaults_when_missing) {
   if (g_cfg.qa_dir.empty()) g_cfg.qa_dir = default_qa_dir();
-  if (g_cfg.pat_file.empty()) g_cfg.pat_file = home_dir() + "/.config/mariadb-qa/jira.pat";
+  if (g_cfg.pat_file.empty()) g_cfg.pat_file = default_pat_file(user_home());
   string p = config_path();
   string text = read_file(p);
   if (text.empty()) {

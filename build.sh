@@ -66,8 +66,11 @@ pick_mariadb_basedir() {
   printf '%s\n' "$best"
 }
 if [ "$WIN" = 1 ]; then
-  BD=/usr                                                     # the MSYS2 libmariadbclient-devel package
-  [ -f "$BD/include/mysql/mysql.h" ] || { echo "[build.sh] $BD/include/mysql/mysql.h missing: pacman -S libmariadbclient-devel" >&2; exit 2; }
+  # MariaDB Connector/C, built for the MSYS2 runtime, which has no package for it
+  BD="${MARIADB_BASEDIR:-/usr/local}"
+  if [ ! -f "$BD/include/mysql/mysql.h" ] || [ ! -f "$BD/lib/libmariadbclient.a" ]; then
+    ./connector_windows.sh "$BD" || exit 2
+  fi
 else
   BD="$(pick_mariadb_basedir)"
   [ -f "$BD/lib/libmariadbclient.a" ] || { echo "[build.sh] $BD: lib/libmariadbclient.a missing" >&2; exit 2; }
@@ -78,12 +81,22 @@ COMMON="-std=c++20 -stdlib=libc++ -pthread -Wall -Wextra -Wno-unused-parameter -
 LINK_COMMON="-fuse-ld=lld -stdlib=libc++ -lc++abi -pthread -Wl,--build-id=sha1 -Wl,-rpath,$BD/lib"
 LIBS="-L$BD/lib -lmariadbclient -lgnutls -lssl -lcrypto -lz -lzstd -lresolv -lm -ldl -lpcre2-8 -lcurl -ldw -lelf"
 if [ "$WIN" = 1 ]; then
-  # the default C++ library and linker; a Windows binary has no rpath and no build-id; the shared
-  # client library carries its own dependencies, and libdw, libelf, libdl and libresolv are Linux
+  # the default C++ library and linker; a Windows binary has no rpath and no build-id; the client
+  # library is the static one, as on Linux, with the TLS and zlib libraries it needs; libdw, libelf
+  # and libresolv are Linux (the runtime has dlopen itself, libdl is only a stub)
   COMMON="${COMMON/-stdlib=libc++ /}"
   COMMON="${COMMON/-fPIC /}"
+  # on Linux the compilers define _GNU_SOURCE themselves; without it -std=c++20 hides usleep, kill,
+  # setenv, pipe2, u_char, the pty calls and more in the MSYS2 headers
+  COMMON="$COMMON -D_GNU_SOURCE"
   LINK_COMMON="-pthread"
-  LIBS="-L$BD/lib -lmariadb -lm -lpcre2-8 -lcurl"
+  LIBS="-L$BD/lib -lmariadbclient -lssl -lcrypto -lz -lm -ldl -lpcre2-8 -lcurl"
+  # the entry points are weak references (verbs.h), and a PE link has no undefined weak symbols, so
+  # the one a NO_GENERATOR or NO_REDUCER build leaves out is defined as 0, which reads as absent
+  absent() { LINK_COMMON="$LINK_COMMON -Wl,--defsym=$1=0"; }
+  [ "${NO_GENERATOR:-0}" != 1 ] && [ -f "$GEN_SRC" ] || absent _Z21omnium_generator_mainiPPc
+  [ -f "$REVGEN_SRC" ] || absent _Z18omnium_revgen_mainiPPc
+  [ "${NO_REDUCER:-0}" != 1 ] && [ -f "$REDUCER_SRC" ] || absent _Z19omnium_reducer_mainiPPc
 fi
 case "$MODE" in
   release|rel) OUT=omnium;        CXXFLAGS="-O3 -march=native -mtune=native -DNDEBUG -g1 -pipe"; LDEXTRA="" ;;
@@ -106,7 +119,13 @@ if [ "$WIN" = 1 ]; then OUT="$OUT.exe"; fi
 # same libc++ as the rest, which under MSAN does not even link. That costs one ccache entry per
 # sanitizer mode.
 GEN_CXXFLAGS="-O2 -DNDEBUG -pipe -Wno-everything"
-if [ "$WIN" = 1 ]; then GEN_CXXFLAGS="${GEN_CXXFLAGS/-Wno-everything/-w}"; fi   # g++ has no -Wno-everything
+# g++ has no -Wno-everything. The embedded sources include <sys/auxv.h>, which MSYS2 lacks, so
+# src/msys2 supplies one. Their global Xoshiro256pp is a class of its own with the name of omnium's
+# (common.h). On Linux the localize step below keeps the two apart; on Windows, where the objects
+# are linked as compiled, theirs is renamed, or its seed_full() would be defined twice.
+if [ "$WIN" = 1 ]; then
+  GEN_CXXFLAGS="${GEN_CXXFLAGS/-Wno-everything/-w} -Isrc/msys2 -DXoshiro256pp=QaXoshiro256pp"
+fi
 case "$MODE" in
   ubasan) GEN_CXXFLAGS="$GEN_CXXFLAGS -fno-omit-frame-pointer -fsanitize=undefined,address" ;;
   tsan)   GEN_CXXFLAGS="$GEN_CXXFLAGS -fno-omit-frame-pointer -fsanitize=thread" ;;
@@ -146,6 +165,18 @@ NINJA="$B/build.ninja"
   echo "  command = $OBJCOPY $LOCALIZE_KEEP --keep-global-symbol=\$keep \$in \$out"
   echo "rule link"
   echo "  command = $CXX \$in -o \$out $LINK_COMMON $LDEXTRA $LIBS"
+  # On Windows the embedded objects are linked as compiled. Localizing a COFF object also turns its
+  # COMDAT leaders (the std templates it instantiates and the .refptr stubs) into static symbols,
+  # the linker then no longer folds them with the other objects', and a stub such as
+  # .refptr.__dso_handle is left unrelocated, which crashes the first static initializer. Besides
+  # the entry point these objects define nothing with external linkage that is not a COMDAT (but
+  # Xoshiro256pp, see GEN_CXXFLAGS), so there is nothing to hide.
+  RAW=_raw; [ "$WIN" != 1 ] || RAW=""
+  localize_obj() {
+    [ "$WIN" = 1 ] && return
+    echo "build $B/$1.o: localize $B/$1_raw.o"
+    echo "  keep = $2"
+  }
   OBJS=""
   for src in src/*.cpp; do
     o="$B/$(basename "${src%.cpp}").o"
@@ -153,24 +184,21 @@ NINJA="$B/build.ninja"
     OBJS="$OBJS $o"
   done
   if [ "${NO_GENERATOR:-0}" != 1 ] && [ -f "$GEN_SRC" ]; then
-    echo "build $B/generator_raw.o: cc_ext $GEN_SRC"
+    echo "build $B/generator$RAW.o: cc_ext $GEN_SRC"
     echo "  defs = -Dmain=omnium_generator_main -DOMNIUM_EMBEDDED"
-    echo "build $B/generator.o: localize $B/generator_raw.o"
-    echo "  keep = _Z21omnium_generator_mainiPPc"
+    localize_obj generator _Z21omnium_generator_mainiPPc
     OBJS="$OBJS $B/generator.o"
   fi
   if [ -f "$REVGEN_SRC" ]; then
-    echo "build $B/revgen_raw.o: cc_ext $REVGEN_SRC"
+    echo "build $B/revgen$RAW.o: cc_ext $REVGEN_SRC"
     echo "  defs = -Dmain=omnium_revgen_main -DOMNIUM_EMBEDDED"
-    echo "build $B/revgen.o: localize $B/revgen_raw.o"
-    echo "  keep = _Z18omnium_revgen_mainiPPc"
+    localize_obj revgen _Z18omnium_revgen_mainiPPc
     OBJS="$OBJS $B/revgen.o"
   fi
   if [ "${NO_REDUCER:-0}" != 1 ] && [ -f "$REDUCER_SRC" ]; then
-    echo "build $B/reducer_raw.o: cc_ext $REDUCER_SRC"
+    echo "build $B/reducer$RAW.o: cc_ext $REDUCER_SRC"
     echo "  defs = -Dmain=omnium_reducer_main -DOMNIUM_EMBEDDED"
-    echo "build $B/reducer.o: localize $B/reducer_raw.o"
-    echo "  keep = _Z19omnium_reducer_mainiPPc"
+    localize_obj reducer _Z19omnium_reducer_mainiPPc
     OBJS="$OBJS $B/reducer.o"
   fi
   echo "build $B/$OUT: link $OBJS"

@@ -1,7 +1,7 @@
 // Created by Roel Van de Paar, MariaDB
-// jira.cpp - Jira REST through libcurl with the PAT ~/jira uses (~/.config/mariadb-qa/jira.pat):
-// the duplicate search behind tt's URLs, issue creation with the same payload log_jira_ticket.sh
-// builds, comments and links. Plus the small JSON reader and writer that needs.
+// jira.cpp - Jira REST through libcurl with the PAT in PAT_FILE (~/.omnium_jira_pat, else the one
+// ~/jira reads): the duplicate search behind tt's URLs, issue creation with the same payload
+// log_jira_ticket.sh builds, comments and links. Plus the small JSON reader and writer that needs.
 #include "verbs.h"
 #include <curl/curl.h>
 
@@ -144,7 +144,13 @@ size_t curl_sink(char* ptr, size_t size, size_t n, void* ud) {
 }
 bool jira_call(const string& method, const string& url, const string& body, string& out, long* http, string* err, bool need_auth = true) {
   string pat = jira_pat();
-  if (need_auth && pat.empty()) { if (err) *err = "no Jira PAT (" + g_cfg.pat_file + " or $JIRA_PAT)"; return false; }
+  if (need_auth && pat.empty()) {
+    if (err)
+      *err = "Jira PAT missing: " + g_cfg.pat_file + " is absent or empty and $JIRA_PAT is not "
+             "set (a personal access token: " + g_cfg.jira_url + ", avatar, Profile, "
+             "Personal Access Tokens)";
+    return false;
+  }
   static std::once_flag once;
   std::call_once(once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
   CURL* c = curl_easy_init();

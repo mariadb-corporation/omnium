@@ -19,3 +19,4 @@ handover_*.md
 /review_*
 /plan.md
 /mariadb-qa/
+.ninja_lock

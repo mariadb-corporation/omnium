@@ -78,8 +78,8 @@ string pick_run(const string& want) {
     if (n.size() != 7 || n[0] != 'O' || !is_digits(n.substr(1))) continue;
     string sf = e.path().string() + "/status.txt";
     if (!file_exists(sf)) continue;
-    auto t = fs::last_write_time(sf, ec);
-    int64_t secs = std::chrono::duration_cast<std::chrono::seconds>(t.time_since_epoch()).count();
+    // file_mtime, not fs::last_write_time: libstdc++'s file_time_type has an epoch of its own
+    int64_t secs = file_mtime(sf);
     bool live = pid_is_live_omnium((pid_t)to_long(trim(read_file(e.path().string() + "/omnium.pid")), 0));
     if (live) secs += 1LL << 40;                          // a live run wins over any finished one
     if (secs > best_t) { best_t = secs; best = e.path().string(); }

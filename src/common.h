@@ -83,6 +83,20 @@ string dirname_of(const string& p);
 string abs_path(const string& p);
 string mount_point_of(const string& p);                         // the mount the path is on: the nearest parent on another device is left out
 string home_dir();
+// The box: omnium built under MSYS2 runs on Windows (docs/windows.md), anything else is Linux
+#if defined(__MSYS__) || defined(__CYGWIN__)
+inline constexpr bool kHostMsys2 = true;
+#else
+inline constexpr bool kHostMsys2 = false;
+#endif
+// the user's Windows profile as an MSYS2 path, /c/Users/Roel; "" off MSYS2
+string windows_home();
+// the person's own home: $HOME, and on Windows the profile, as the MSYS2 home is a folder of the
+// shared MSYS2 install (a HOME that was set to something else is kept)
+string user_home();
+// the Jira token file when PAT_FILE names none: <home>/.omnium_jira_pat, or the file ~/jira reads
+// when only that one exists
+string default_pat_file(const string& home);
 string self_exe();                                            // /proc/self/exe resolved
 extern string g_exe_override;                                 // a run's own copy of the binary; "" = /proc/self/exe
 string now_hms();                                             // HH:MM:SS local
@@ -157,7 +171,7 @@ uint64_t rng_seed_used();
 struct Config {
   string email;                       // one mail per new inbox item; empty = no mail
   string jira_url = "https://jira.mariadb.org";                 // the Jira the filing talks to
-  string pat_file;                    // Jira PAT, the same file ~/jira uses
+  string pat_file;                    // Jira PAT: ~/.omnium_jira_pat, else the one ~/jira reads
   int smtp_port = 25;                 // the port the mail goes to on the recipient's mail server
   int ram_cap_pct = 85;               // no new server above this RAM use
   int shm_cap_pct = 90;               // hard cap on /dev/shm use

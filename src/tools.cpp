@@ -196,7 +196,16 @@ int cmd_init(const Args& a) {
     check(!core.empty() && core[0] != '|' && core.find("core") != string::npos, "kernel.core_pattern writes a core file next to the server (" + core + ")",
           "sudo sysctl -w kernel.core_pattern=core (see ~/mariadb-qa/setup_server.sh)");
 #endif
-    check(!trim(pat).empty(), "a Jira PAT in " + g_cfg.pat_file, "jira.mariadb.org: avatar, Profile, Personal Access Tokens; then (umask 077; printf '%s\\n' '<token>' > " + g_cfg.pat_file + ")");
+    // the token is typed at a prompt, so it is in no shell history and no process list; a Windows
+    // file takes its protection from an ACL, which umask does not set (MSYS2 mounts ignore ACLs)
+    string file = sh_quote(g_cfg.pat_file);
+    string how = "jira.mariadb.org: avatar, Profile, Personal Access Tokens; then (" +
+                 string(kHostMsys2 ? "" : "umask 077; ") +
+                 "read -rsp 'token: ' t; printf '%s\\n' \"$t\" > " + file + ")";
+    if (kHostMsys2)
+      how += ", and keep it to your account: icacls \"$(cygpath -w " + file +
+             ")\" /inheritance:r /grant:r \"$USERNAME:F\"";
+    check(!trim(pat).empty(), "a Jira PAT in " + g_cfg.pat_file, how);
   }
   {
     Registry r;

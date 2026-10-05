@@ -39,9 +39,13 @@ echo [build_windows] MSYS2 at %MSYS%
 rem ---- the packages the build and the runs need ---------------------------------------------
 rem  Names are the MSYS2 (not the mingw) packages, because omnium is built against the MSYS2
 rem  runtime for fork and the rest. build.sh compiles with clang++ when the box has it, else g++.
+rem  MSYS2 has no package for the MariaDB client library under that runtime, so build.sh builds
+rem  Connector/C from source with connector_windows.sh the first time: that is what cmake and the
+rem  openssl and zlib headers are for.
 rem  openssl, xz, findutils and perl are called by the trials, not by the build: the encryption
 rem  area's key files, the INFILE extraction, the all-disk SQL index and the MTR runner.
-set PKGS=gcc binutils ninja ccache git libpcre2-devel libcurl-devel libmariadbclient-devel openssl xz findutils perl
+set PKGS=gcc binutils ninja ccache git cmake pcre2-devel libcurl-devel
+set PKGS=%PKGS% openssl-devel zlib-devel openssl xz findutils perl
 set MISSING=
 for %%P in (%PKGS%) do (
   "%MSYS%\usr\bin\bash.exe" -lc "pacman -Q %%P >/dev/null 2>&1" || set MISSING=!MISSING! %%P
@@ -61,10 +65,15 @@ if not "!MISSING!"=="" (
 )
 
 rem ---- build ---------------------------------------------------------------------------------
+rem  A login shell starts in the home folder unless CHERE_INVOKING is set, so the shell is started
+rem  in the folder of this script and no Windows path has to be turned into a POSIX one.
 set HERE=%~dp0
-for /f "delims=" %%D in ('"%MSYS%\usr\bin\cygpath.exe" -u "%HERE%"') do set UDIR=%%D
-"%MSYS%\usr\bin\bash.exe" -lc "cd '%UDIR%' && ./build.sh %MODE%"
-if errorlevel 1 (
+pushd "%HERE%"
+set CHERE_INVOKING=1
+"%MSYS%\usr\bin\bash.exe" -lc "./build.sh %MODE%"
+set RC=%errorlevel%
+popd
+if not "%RC%"=="0" (
   echo [build_windows] the build failed; the lines above say why
   exit /b 1
 )

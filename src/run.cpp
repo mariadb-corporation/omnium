@@ -117,8 +117,8 @@ int cmd_run(const Args& a) {
         if (n.size() != 7 || n[0] != 'O' || !is_digits(n.substr(1))) continue;
         if (!file_exists(e.path().string() + "/run.conf")) continue;
         if (pid_is_live_omnium((pid_t)to_long(trim(read_file(e.path().string() + "/omnium.pid")), 0))) continue;
-        auto t = fs::last_write_time(e.path().string() + "/omnium.ledger", ec);
-        int64_t secs = std::chrono::duration_cast<std::chrono::seconds>(t.time_since_epoch()).count();
+        // file_mtime, not fs::last_write_time: libstdc++'s file_time_type has an epoch of its own
+        int64_t secs = file_mtime(e.path().string() + "/omnium.ledger");
         if (secs > best) { best = secs; dir = e.path().string(); }
       }
       if (dir.empty()) { printf("no stopped omnium run with a run.conf under %s\n", g_cfg.data_dir.c_str()); return 1; }

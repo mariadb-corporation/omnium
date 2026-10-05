@@ -4,11 +4,15 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <pwd.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/wait.h>
 #include <time.h>
+#if defined(__MSYS__) || defined(__CYGWIN__)
+#include <sys/cygwin.h>
+#endif
 
 const char* OMNIUM_VERSION = "1.0";
 
@@ -220,6 +224,26 @@ string abs_path(const string& p) {
 string home_dir() {
   const char* h = getenv("HOME");
   return h && *h ? string(h) : string("/root");
+}
+string windows_home() {
+#if defined(__MSYS__) || defined(__CYGWIN__)
+  const char* up = getenv("USERPROFILE");
+  char buf[4096];
+  if (up && *up && cygwin_conv_path(CCP_WIN_A_TO_POSIX, up, buf, sizeof buf) == 0) return buf;
+#endif
+  return {};
+}
+string user_home() {
+  string h = home_dir(), w = windows_home();
+  if (w.empty()) return h;
+  // only MSYS2's own home is replaced: a HOME that was set to something else, a check's or a
+  // person's, wins
+  struct passwd* pw = getpwuid(getuid());
+  return pw && pw->pw_dir && h == pw->pw_dir ? w : h;
+}
+string default_pat_file(const string& home) {
+  string mine = home + "/.omnium_jira_pat", theirs = home + "/.config/mariadb-qa/jira.pat";
+  return !file_exists(mine) && file_exists(theirs) ? theirs : mine;
 }
 string self_exe() {
   char buf[4096];

@@ -340,6 +340,29 @@ static void st_kb() {
   unlink(rl.c_str());
 }
 
+// the cmake line of omnium build, for a source tree that st_build has laid out
+static void st_cmake_command(const SourceInfo& si, string& err) {
+  auto cm = cmake_command(si, "opt", "/test/X", &err);
+  string line = join(cm, " ");
+  st_check(!cm.empty() && cm[0] == "cmake" && cm[2] == "-G" && cm[3] == "Ninja", "cmake_command shape " + err);
+  for (const char* want : {"-DCMAKE_BUILD_TYPE=RelWithDebInfo", "-DPLUGIN_PERFSCHEMA=YES", "-DWITH_MARIABACKUP=1", "-DWITH_ROCKSDB=1",
+                           "-DWITH_SSL=bundled", "-DINSTALL_LAYOUT=STANDALONE", "-DCMAKE_INSTALL_PREFIX=/test/X"})
+    st_check(line.find(want) != string::npos, string("cmake_command opt has ") + want);
+  st_check(line.find("-DWITH_DEBUG=ON") == string::npos, "cmake_command opt has no WITH_DEBUG");
+  line = join(cmake_command(si, "dbg", "/test/X", &err), " ");
+  st_check(line.find("-DCMAKE_BUILD_TYPE=Debug") != string::npos && line.find("-DWITH_DEBUG=ON") != string::npos &&
+           line.find("-DWITH_INNODB_EXTRA_DEBUG=ON") != string::npos && line.find("-DPLUGIN_PERFSCHEMA=NO") != string::npos, "cmake_command dbg flags");
+  line = join(cmake_command(si, "ubasan-dbg", "/test/X", &err), " ");
+  st_check(line.find("-DWITH_ASAN=ON") != string::npos && line.find("-fsanitize=address,undefined") != string::npos &&
+           line.find("-DWITH_MARIABACKUP=0") != string::npos && line.find("-O1 -fPIC") != string::npos && line.find("-shared-libasan") != string::npos, "cmake_command ubasan flags");
+  if (is_executable("/usr/bin/clang-20") && dir_exists("/MSAN_libs")) {
+    line = join(cmake_command(si, "msan-opt", "/test/X", &err), " ");
+    st_check(line.find("-DWITH_MSAN=ON") != string::npos && line.find("clang-20") != string::npos && line.find("-DWITH_SSL=/MSAN_libs") != string::npos &&
+             line.find("-fsanitize-ignorelist=") != string::npos && line.find("-DWITH_ROCKSDB=0") != string::npos &&
+             line.find("-DPLUGIN_PERFSCHEMA=NO") != string::npos, "cmake_command msan flags");
+  }
+}
+
 static void st_build() {
   string tree = fmt("/tmp/omnium_st_tree_%d", getpid());
   mkdirs(tree + "/support-files/rpm");
@@ -369,25 +392,9 @@ static void st_build() {
   write_file(tree + "/VERSION", "MYSQL_VERSION_MAJOR=13\nMYSQL_VERSION_MINOR=1\nMYSQL_VERSION_PATCH=0\nMYSQL_VERSION_EXTRA=\nSERVER_MATURITY=alpha\n");
   unlink((tree + "/support-files/rpm/mariadb-enterprise.spec.in").c_str());
   st_check(source_info(tree, si, &err) && !si.es, "source_info cs again");
-  auto cm = cmake_command(si, "opt", "/test/X", &err);
-  string line = join(cm, " ");
-  st_check(!cm.empty() && cm[0] == "cmake" && cm[2] == "-G" && cm[3] == "Ninja", "cmake_command shape " + err);
-  for (const char* want : {"-DCMAKE_BUILD_TYPE=RelWithDebInfo", "-DPLUGIN_PERFSCHEMA=YES", "-DWITH_MARIABACKUP=1", "-DWITH_ROCKSDB=1",
-                           "-DWITH_SSL=bundled", "-DINSTALL_LAYOUT=STANDALONE", "-DCMAKE_INSTALL_PREFIX=/test/X"})
-    st_check(line.find(want) != string::npos, string("cmake_command opt has ") + want);
-  st_check(line.find("-DWITH_DEBUG=ON") == string::npos, "cmake_command opt has no WITH_DEBUG");
-  line = join(cmake_command(si, "dbg", "/test/X", &err), " ");
-  st_check(line.find("-DCMAKE_BUILD_TYPE=Debug") != string::npos && line.find("-DWITH_DEBUG=ON") != string::npos &&
-           line.find("-DWITH_INNODB_EXTRA_DEBUG=ON") != string::npos && line.find("-DPLUGIN_PERFSCHEMA=NO") != string::npos, "cmake_command dbg flags");
-  line = join(cmake_command(si, "ubasan-dbg", "/test/X", &err), " ");
-  st_check(line.find("-DWITH_ASAN=ON") != string::npos && line.find("-fsanitize=address,undefined") != string::npos &&
-           line.find("-DWITH_MARIABACKUP=0") != string::npos && line.find("-O1 -fPIC") != string::npos && line.find("-shared-libasan") != string::npos, "cmake_command ubasan flags");
-  if (is_executable("/usr/bin/clang-20") && dir_exists("/MSAN_libs")) {
-    line = join(cmake_command(si, "msan-opt", "/test/X", &err), " ");
-    st_check(line.find("-DWITH_MSAN=ON") != string::npos && line.find("clang-20") != string::npos && line.find("-DWITH_SSL=/MSAN_libs") != string::npos &&
-             line.find("-fsanitize-ignorelist=") != string::npos && line.find("-DWITH_ROCKSDB=0") != string::npos &&
-             line.find("-DPLUGIN_PERFSCHEMA=NO") != string::npos, "cmake_command msan flags");
-  }
+  // omnium build drives clang and the Linux build scripts' cmake lines: it is not ported to Windows
+  if (kHostMsys2) st_skip("cmake_command: omnium build is not ported to Windows");
+  else st_cmake_command(si, err);
   st_eq(tag_from_branch("13.1"), "", "tag_from_branch version");
   st_eq(tag_from_branch("12.3-enterprise"), "", "tag_from_branch es version");
   st_eq(tag_from_branch("main"), "", "tag_from_branch main");
@@ -716,8 +723,16 @@ static void st_fixtures() {
     CmdResult sh = run_capture({script, "errors", "./9/log/master.err"}, 300, hd);
     string mine;
     bool ok = els_run("errors", {hd + "/9/log/master.err"}, false, mine, nullptr);
-    st_check(sh.rc == 1 && sh.out.find("binary file matches") != string::npos && sh.out.find("MUTEX_ERROR") == string::npos,
-             "the shell scan drops the whole answer on a log line with a byte the locale cannot read");
+    // Grep 3.5 and later send the note to stderr and the scan fails. The grep 3.0 of MSYS2 prints
+    // "Binary file (standard input) matches" on stdout, so the script answers UNTYPED instead.
+    if (kHostMsys2)
+      st_skip("the shell scan drops the whole answer on a log line with a byte the locale cannot "
+              "read (MSYS2's grep 3.0 puts its note on stdout, so the script answers UNTYPED)");
+    else
+      st_check(sh.rc == 1 && sh.out.find("binary file matches") != string::npos &&
+               sh.out.find("MUTEX_ERROR") == string::npos,
+               "the shell scan drops the whole answer on a log line with a byte the locale "
+               "cannot read");
     st_check(ok && starts_with(trim(mine), "MUTEX_ERROR|safe_mutex:"), "omnium reads that line all the same [" + trim(mine) + "]");
   }
   // the fallback chain on a log with no core
@@ -2158,8 +2173,45 @@ static void st_portability() {
     string mp = mount_point_of(tmp);
     st_check(!mp.empty() && starts_with(tmp, mp) && dir_exists(mp), "mount_point_of: a parent of the path that is a directory");
     st_eq(mount_point_of("/"), "/", "mount_point_of: the root is its own mount");
-    st_eq(mount_point_of("/proc/self"), "/proc", "mount_point_of: a path on a mounted filesystem gives that mount");
+    // /proc/<pid> is on a device of its own under MSYS2, so there /proc/self is no path on /proc
+    if (kHostMsys2)
+      st_skip("mount_point_of: a path on a mounted filesystem gives that mount "
+              "(/proc/<pid> is on a device of its own under MSYS2)");
+    else
+      st_eq(mount_point_of("/proc/self"), "/proc",
+            "mount_point_of: a path on a mounted filesystem gives that mount");
     st_eq(mount_point_of(tmp + "/no_such_dir_here"), "/", "mount_point_of: a path that is not there gives the root");
+  }
+  // the Jira token file: a dotfile in the home directory, or the ~/jira one if only that exists
+  {
+    string ph = tmp + "/pathome";
+    mkdirs(ph + "/.config/mariadb-qa");
+    st_eq(default_pat_file(ph), ph + "/.omnium_jira_pat",
+          "the Jira token defaults to a dotfile in the home directory");
+    write_file(ph + "/.config/mariadb-qa/jira.pat", "x\n");
+    st_eq(default_pat_file(ph), ph + "/.config/mariadb-qa/jira.pat",
+          "and to the file ~/jira reads when only that one is there");
+    write_file(ph + "/.omnium_jira_pat", "x\n");
+    st_eq(default_pat_file(ph), ph + "/.omnium_jira_pat",
+          "and to its own file as soon as that is there");
+    // the home of a person: $HOME on Linux, and on Windows the profile, which is no folder of the
+    // shared MSYS2 install, unless HOME was set to something other than MSYS2's own home
+    string wh = windows_home();
+    if (kHostMsys2)
+      st_check(wh.empty() || (starts_with(wh, "/") &&
+                              (user_home() == wh || user_home() == home_dir())),
+               "under MSYS2 the home is the Windows profile (an MSYS2 path), or the HOME set");
+    else
+      st_check(wh.empty() && user_home() == home_dir(), "off MSYS2 the home is $HOME");
+    {
+      // a HOME of its own is the home: every check that starts an omnium with one stays away from
+      // the real files
+      string keep = home_dir();
+      setenv("HOME", (tmp + "/pathome").c_str(), 1);
+      st_eq(user_home(), tmp + "/pathome",
+            "a HOME that was set wins, so a check's temp home keeps the real token out of reach");
+      setenv("HOME", keep.c_str(), 1);
+    }
   }
   // two rng() calls are two streams
   {
@@ -2199,6 +2251,20 @@ int cmd_selftest(const Args& a) {
   const char* os = getenv("OMNIUM_SET");
   setenv("OMNIUM_SET", (string(os ? os : "") + "\nEMAIL=\nJIRA_URL=http://127.0.0.1:9\n").c_str(), 1);
   config_load(false);
+  // The stand-in Jira takes any token, so every check that talks to it carries a stand-in one (the
+  // omniums the checks start inherit it): the real token stays in its file, and a box that has
+  // none can run the checks. The note under the summary says so, as only a real search or filing
+  // needs one.
+  string pat_note;
+  if (jira_pat().empty())
+    pat_note = "Jira PAT missing: " + g_cfg.pat_file + " is absent or empty and $JIRA_PAT is not "
+               "set. These checks do not need one (the stand-in Jira takes any token), but a real "
+               "search or filing does: jira.mariadb.org, avatar, Profile, Personal Access Tokens, "
+               "and omnium init says how to store it";
+  const char* env_pat = getenv("JIRA_PAT");
+  const string keep_pat = env_pat ? env_pat : "";
+  const bool had_env_pat = env_pat != nullptr;
+  setenv("JIRA_PAT", "omnium-selftest-stand-in", 1);
   double t0 = now_ms();
   // nothing this check files may reach the box's own queues, so they point into the temp dir from
   // here on; a check that reloads the settings puts the pair back afterwards
@@ -2239,6 +2305,8 @@ int cmd_selftest(const Args& a) {
   printf("selftest: %ld checks, %ld failed (%.1f s)\n", p + f, f, (now_ms() - t0) / 1000.0);
   for (auto& w : g_st_failed) printf("  failed: %s\n", w.c_str());
   for (auto& w : g_st_skipped) printf("  skipped: %s\n", w.c_str());
+  if (!pat_note.empty()) printf("  note: %s\n", pat_note.c_str());
+  if (had_env_pat) setenv("JIRA_PAT", keep_pat.c_str(), 1); else unsetenv("JIRA_PAT");
   return f == 0 ? 0 : 1;
 }
 
@@ -2793,7 +2861,10 @@ static void st_plumbing() {
     raise_fd_limit();
     struct rlimit rl{};
     st_check(getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur == rl.rlim_max, "the open-file limit is lifted to the hard limit");
-    {
+    if (kHostMsys2)
+      st_skip("the out-of-memory score of a child: /proc/<pid>/oom_score_adj is the Linux "
+              "kernel's, and Windows has no OOM killer");
+    else {
       pid_t sp = spawn_program({"/bin/sh", "-c", "sleep 30; exit 0"}, "/dev/null", "", true, {}, false);
       st_check(set_oom_score(sp, 500), "the out-of-memory score of a child is raised");
       st_eq(trim(read_file(fmt("/proc/%d/oom_score_adj", (int)sp))), "500", "and the kernel holds the new score");
@@ -2930,13 +3001,16 @@ static void st_plumbing() {
   }
   // --- the process helpers ---------------------------------------------------------------------
   {
-    pid_t p = spawn_program({"/bin/sh", "-c", "sleep 30"}, tmp + "/sleep.log", tmp, true, {}, true);
+    // two commands, so that a shell which runs the last one of a -c string in its own process
+    // (bash does) stays the /bin/sh the line below names
+    pid_t p = spawn_program({"/bin/sh", "-c", "sleep 30; exit 0"}, tmp + "/sleep.log", tmp, true,
+                            {}, true);
     st_check(p > 0, "spawn_program starts a program");
     st_check(pid_alive(p), "the child is alive");
     // right after the fork the child is still a copy of this omnium, and in its exec the line reads empty
     string pcl;
     for (int i = 0; i < 100 && (pcl = proc_cmdline(p)).find("sleep 30") == string::npos; i++) usleep(20000);
-    st_check(pcl == "/bin/sh -c sleep 30", "proc_cmdline reads the command line");
+    st_check(pcl == "/bin/sh -c sleep 30; exit 0", "proc_cmdline reads the command line");
     st_check(proc_rss_bytes(p) > 0, "proc_rss_bytes reads the memory use");
     st_check(wait_pid(p, 200) == -1, "wait_pid says still running");
     {
@@ -3499,7 +3573,14 @@ static void st_detect_more() {
     mkdirs(fbd + "/bin");
     copy_file("/bin/true", fbd + "/bin/mariadbd");
     write_file(tmp + "/BASEDIR", fbd + "\n");
-    st_eq(binary_for_dir(tmp), fbd + "/bin/mariadbd", "a BASEDIR file points the chain at that build");
+    // the chain reads a core with gdb, so it takes an ELF binary; a Windows server is a PE file
+    // and writes no core
+    if (kHostMsys2)
+      st_skip("a BASEDIR file points the chain at that build (the chain takes ELF server "
+              "binaries, and a Windows server is a PE file)");
+    else
+      st_eq(binary_for_dir(tmp), fbd + "/bin/mariadbd",
+            "a BASEDIR file points the chain at that build");
     remove_tree(tmp + "/BASEDIR");
     st_binary_for_dir_elf_test();
   }
@@ -3751,6 +3832,30 @@ static void st_reduce_and_report() {
   remove_tree(tmp);
 }
 
+// a holder started through a link named o: its command line has no omnium in it, and its binary,
+// which /proc/<pid>/exe gives on Linux, still tells it is a live omnium
+static void st_holder_through_link(const string& tmp) {
+  string ldir = fmt("/tmp/olk_%d", (int)getpid());
+  mkdirs(ldir);
+  std::error_code ec;
+  fs::create_symlink(self_exe(), ldir + "/o", ec);
+  string save_exe = g_exe_override;
+  g_exe_override = ldir + "/o";
+  Child lh;
+  bool have = spawn_role(lh, "hold", {"x"}, "/dev/null");
+  g_exe_override = save_exe;
+  for (int i = 0; have && i < 100 && proc_cmdline(lh.pid).find(ldir) == string::npos; i++) usleep(20000);   // until the exec is done
+  string lwd = tmp + "/O888888";
+  mkdirs(lwd);
+  write_file(lwd + "/omnium.ledger", "1 run created\n");
+  write_file(lwd + "/omnium.pid", std::to_string((int)(have ? lh.pid : 0)) + "\n");
+  st_check(have && proc_cmdline(lh.pid).find("omnium") == string::npos, "a holder started through the o link has no omnium in its command line");
+  st_check(have && pid_is_live_omnium(lh.pid), "and its binary still tells it is a live omnium");
+  st_check(!workdir_open(lwd, true), "so the workdir it holds is not opened");
+  if (have) st_stub_stop(lh);
+  remove_tree(ldir);
+}
+
 // the last corners: the binlog marker files, the stack verb, the parity verb on a corpus of its
 // own, the view's own run picker, and the builds and known-bug verbs on temporary copies
 // The small branches that need no server: the JSON reader, the build registry order, the workdir
@@ -3814,26 +3919,15 @@ static void st_units() {
       st_eq(trim(read_file(swd + "/omnium.pid")), std::to_string((long)getpid()), "and the lock now names this process");
       release_lock();
     }
-    {                                                          // a live omnium whose command line does not name it: a run started through the o link
-      string ldir = fmt("/tmp/olk_%d", (int)getpid());
-      mkdirs(ldir);
-      std::error_code ec;
-      fs::create_symlink(self_exe(), ldir + "/o", ec);
-      string save_exe = g_exe_override;
-      g_exe_override = ldir + "/o";
-      Child lh;
-      bool have = spawn_role(lh, "hold", {"x"}, "/dev/null");
-      g_exe_override = save_exe;
-      for (int i = 0; have && i < 100 && proc_cmdline(lh.pid).find(ldir) == string::npos; i++) usleep(20000);   // until the exec is done
-      string lwd = tmp + "/O888888";
-      mkdirs(lwd);
-      write_file(lwd + "/omnium.ledger", "1 run created\n");
-      write_file(lwd + "/omnium.pid", std::to_string((int)(have ? lh.pid : 0)) + "\n");
-      st_check(have && proc_cmdline(lh.pid).find("omnium") == string::npos, "a holder started through the o link has no omnium in its command line");
-      st_check(have && pid_is_live_omnium(lh.pid), "and its binary still tells it is a live omnium");
-      st_check(!workdir_open(lwd, true), "so the workdir it holds is not opened");
-      if (have) st_stub_stop(lh);
-      remove_tree(ldir);
+    {
+      // a live omnium whose command line does not name it: a run started through the o link.
+      // /proc/<pid>/exe is the resolved binary on Linux; MSYS2's names the path the process was
+      // started by, link and all
+      if (kHostMsys2)
+        st_skip("a holder started through the o link: its binary tells it is a live omnium "
+                "(MSYS2's /proc/<pid>/exe does not resolve the link)");
+      else
+        st_holder_through_link(tmp);
       // a live pid that is some other program: what a lock names after a reboot
       pid_t sp = spawn_program({"sleep", "30"}, "/dev/null", "", true);
       for (int i = 0; sp > 0 && i < 100 && !starts_with(proc_cmdline(sp), "sleep"); i++) usleep(20000);
@@ -4150,8 +4244,12 @@ static void st_units() {
     CmdResult rp2 = child({"report", wd, "1", "--no-matrix", "--no-mtr"}, 600);
     st_check(rp2.rc == 0 && rp2.out.find("already filed") != string::npos, "a report that is already filed is not rewritten [" + trim(tail_lines(rp2.out, 1)) + "]");
     st_eq(trim(read_file(ctest + "/omnium/HUMAN-queue/O777777_bug1.report")), "edited by hand", "and the text stays as it was");
-    // a run picked up again: the saved trial has a reduced testcase, so the report is what is left
-    {
+    // a run picked up again: the saved trial has a reduced testcase, so the report is what is
+    // left. The resume needs a build to test, so a box with none under TEST_DIR cannot run this
+    if (bpath2.empty())
+      st_skip("a stopped run is picked up again: there is no build with a server binary under " +
+              g_cfg.test_dir);
+    else {
       string rwd = cdata + "/O888888";
       mkdirs(rwd);
       write_file(rwd + "/omnium.ledger", fmt("%lld run created 2026-09-05 05:00:00 seed 1\n", (long long)now_s()));

@@ -31,8 +31,9 @@ SKIP_SELFTEST=1 ./build.sh
 Each sanitizer binary takes the same verbs, so `./omnium_tsan selftest` is the whole check list under
 ThreadSanitizer. `docs/sanitizer_builds.md` says what each one can prove here.
 
-On Windows, `build_windows.bat` builds the same binary under MSYS2; `docs/windows.md` covers that
-side: the build, the Windows basedirs and how a Windows crash gets its UniqueID.
+On Windows, `build_windows.bat` builds the same binary under MSYS2 (the client library, MariaDB
+Connector/C, is built from source the first time); `docs/windows.md` covers that side: the build,
+the Windows basedirs, the Jira token, the selftest and how a Windows crash gets its UniqueID.
 
 `./coverage.sh` runs the selftest against `./omnium_cov` and prints the line coverage of omnium's own
 sources. `./coverage.sh --deep` adds the checks that need a real server, `--html` writes a report
@@ -117,6 +118,7 @@ cannot run is named under the summary as skipped. `build.sh` runs the plain set 
 /data/omnium.seen               every UID any run has seen, with the first workdir and trial
 /dev/shm/O<id>/                 the live trial directories of a run (tmpfs)
 ~/.omnium.conf                  the settings; omnium config lists them, KEY=VALUE on the command line overrides one
+~/.omnium_jira_pat              the Jira token, for your account only; PAT_FILE names another, and the one ~/jira reads is used if it is the only one
 ~/.omnium_aliases               short names, written by omnium init: orun ost ot ott osr orep omx oin oad obuilds ostack otui ocli omtr ofr ocl orp oi
 ~/.bashrc                       omnium adds alias om=<repo>/omnium the first time it runs, when no om alias is there
 <repo>/filters/adv.filter       omnium's own line filter for the generated SQL
