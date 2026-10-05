@@ -680,6 +680,10 @@ bool copy_file(const string& from, const string& to) {
 bool move_tree(const string& from, const string& to, string* why) {
   std::error_code ec;
   fs::rename(from, to, ec);
+  // Windows will not rename a folder with a file in it that another process has open (the minidump of a crashed server,
+  // still being written or scanned, is one) and lets go within seconds, so the rename is tried again for half a minute
+  if (kHostMsys2)
+    for (int i = 0; ec && (ec.value() == EACCES || ec.value() == EBUSY || ec.value() == EPERM) && i < 120; i++) { usleep(250000); fs::rename(from, to, ec); }
   if (!ec) return true;
   if (ec.value() != EXDEV) { if (why) *why = ec.message(); return false; }
   if (!copy_tree(from, to, why)) return false;

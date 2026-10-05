@@ -133,6 +133,8 @@ uint64_t dir_total_bytes(const string& path);
 int dir_used_pct(const string& path);
 bool core_on_data(int shm_used_pct);                           // true = this trial's datadir, and its core, go under DATA_DIR
 string backup_issue_uid(const string& step, const string& message);   // BACKUP_ISSUE|<step>|<message, numbers as N>
+string backup_failure_line(const string& out);                 // the line of a failed backup step's output that says what failed
+string strip_exe_names(const string& text);                    // s/mariadbd.exe/mariadbd/ and the like (detect.cpp)
 int ram_used_pct();
 bool meminfo_parse(const string& text, uint64_t& total_kb, uint64_t& avail_kb);   // /proc/meminfo; MemFree stands in where MemAvailable is missing (Cygwin)
 uint64_t ram_total_bytes();

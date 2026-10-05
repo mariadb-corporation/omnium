@@ -2235,6 +2235,24 @@ static void st_portability() {
       st_check(c1.empty(), "private_exe_copy: nothing off MSYS2");
     }
     unlink(fake.c_str());
+    // Windows will not rename a folder that holds a file another process has open (a crashed server's minidump, still being
+    // written or scanned); move_tree tries again until the file is let go. A native process holds one here for a few seconds.
+    if (kHostMsys2 && file_exists("/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")) {
+      string d = tmp + "/mv_held", marker = tmp + "/mv_marker.txt";
+      mkdirs(d);
+      write_file(d + "/held.dmp", "MDMP");
+      string script = "$fs = [System.IO.File]::Open('" + native_path(d + "/held.dmp") + "', 'Open', 'ReadWrite', 'Read'); Set-Content '" + native_path(marker) +
+                      "' 'locked'; Start-Sleep -Seconds 4; $fs.Close()";
+      pid_t hp = spawn_program({"/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-Command", script}, tmp + "/mv_ps.log", "", true);
+      for (int i = 0; i < 200 && hp > 0 && !file_exists(marker); i++) usleep(100000);
+      string mvwhy;
+      double t0 = now_ms();
+      bool moved = file_exists(marker) && move_tree(d, tmp + "/mv_moved", &mvwhy);
+      double took = (now_ms() - t0) / 1000.0;
+      st_check(moved && dir_exists(tmp + "/mv_moved") && !dir_exists(d), "move_tree: a folder with a file another process holds is moved once the file is let go [" + mvwhy + "]");
+      st_check(took > 1.0, fmt("and it waited for that (%.1f s)", took));
+      if (hp > 0) wait_pid(hp, 20000);
+    }
     // a Windows path given as an argument is absolute there, not a name under the working directory
     if (kHostMsys2) {
       st_eq(abs_path("C:/Windows"), "/c/Windows", "abs_path: C:/x is the drive's path");
@@ -2471,6 +2489,22 @@ static void st_backup_uid() {
   st_eq(backup_issue_uid("the incremental backup", "[00] 2026-09-12 13:59:30 failed to copy datafile 123"), "BACKUP_ISSUE|the incremental backup|failed to copy datafile N", "a backup UID drops the line prefix and makes numbers N");
   st_eq(backup_issue_uid("the incremental backup", "[01] 2026-10-01 01:02:03 failed to copy datafile 9"), backup_issue_uid("the incremental backup", "[00] 2026-09-12 13:59:30 failed to copy datafile 123"), "the same cause with other numbers is the same backup UID");
   st_eq(backup_issue_uid("the full backup", "hang"), "BACKUP_ISSUE|the full backup|hang", "a hang is its own backup UID");
+  // the line a failed step is named by: the first that says what failed, not the shutdown that ends the output
+  string aria = "[00] 2026-10-05 16:40:01 mariadb-backup.exe: Error 176 reading index file `test`.`t4` block 1\n"
+                "[00] 2026-10-05 16:40:01 error: aria_read index from .\\test\\t4#P#p2.MAI failed with error 176\n"
+                "Aria data files backup process is finished with error\n"
+                "mariabackup: Stopping log copying thread.\n"
+                "2026-10-05 16:40:02 0 [Note] InnoDB: Starting shutdown...\n";
+  st_eq(backup_failure_line(aria), "[00] 2026-10-05 16:40:01 mariadb-backup.exe: Error 176 reading index file `test`.`t4` block 1", "a failed step is named by the first line that says what failed");
+  st_eq(backup_issue_uid("the full backup of the busy server", backup_failure_line(aria)),
+        "BACKUP_ISSUE|the full backup of the busy server|mariadb-backup: Error N reading index file `test`.`tN` block N", "and its UID reads the cause, numbers as N and the .exe of the tool left out");
+  st_eq(backup_issue_uid("the full backup", "mariadb-backup: Error 176 reading index file"), backup_issue_uid("the full backup", "mariadb-backup.exe: Error 176 reading index file"),
+        "a Linux and a Windows tool's failure are one UID");
+  st_eq(backup_failure_line("[00] 2026-10-05 16:41:13 Start copying aria log file tail\nmy_setwd() failed , C:\\x\n"), "my_setwd() failed , C:\\x", "a failing last line is still the one");
+  st_eq(backup_failure_line("$ mariadb-backup --backup --error-log\n2026-10-05 16:40:00 0 [Note] InnoDB: a read failed, retrying\ncannot open file x\nInnoDB: Starting shutdown...\n"),
+        "cannot open file x", "a prompt line and a server [Note] do not count");
+  st_eq(backup_failure_line("copying a\ncopying b\nall done\n\n"), "all done", "with no line that says so, the last one is named");
+  st_eq(backup_failure_line(""), "", "and an empty output names nothing");
 }
 
 int cmd_selftest(const Args& a) {
@@ -2850,7 +2884,7 @@ string fixture_dir(const string& root, const UidFixture& f) {
 // every detection class, on a log of its own: the UID has to come out exactly as the chain gives it
 // The last resort of the UniqueID chain. These logs hold nothing the typed scan knows, so the
 // string is picked by the fallback, and several of them are rewritten by a rule of their own.
-struct FbFixture { const char* name; const char* log; const char* uid; };
+struct FbFixture { const char* name; const char* log; const char* uid; bool fix = false; };   // fix: a fix Linux has not taken, checked where kTakeFixes
 const FbFixture FALLBACK_FIXTURES[] = {
   {"binlog_rollback",
       "mariadbd: /test/13.1/sql/log.cc:2323: virtual int MYSQL_BIN_LOG::rollback(THD*, bool): Assertion `all' failed.\n",
@@ -2892,7 +2926,7 @@ const FbFixture FALLBACK_FIXTURES[] = {
   {"innodb_in_file_windows",
       "2026-10-05 15:30:00 0 [ERROR] InnoDB: Assertion failure in file C:\\test\\13.1\\storage\\innobase\\fts\\fts0fts.cc line 2108\r\n"
       "InnoDB: Failing assertion: result != FTS_INVALID\r\n",
-   "FALLBACK|C:\\test\\13.1\\storage\\innobase\\fts\\fts0fts.cc line 2108"},
+   "FALLBACK|C:\\test\\13.1\\storage\\innobase\\fts\\fts0fts.cc line 2108", true},
 };
 // One log per rule of the error-log scan, so every typed prefix and every severity tier is walked.
 // The UID is what error_log_scan.sh top gives; the deep run compares the two.
@@ -2986,6 +3020,7 @@ static void st_detect_classes() {
     st_eq(ok ? trim(r.uid) : trim(r.err), f.uid, string("UID of a ") + f.name + " log");
   }
   for (auto& f : FALLBACK_FIXTURES) {
+    if (f.fix && !kTakeFixes) continue;
     string d = fb_fixture_dir(tmp, f);
     string e;
     st_eq(trim(uid_fallback(d + "/log/master.err", &e)), f.uid, string("the fallback UID of a ") + f.name + " log");
@@ -3050,6 +3085,7 @@ static void st_detect_parity() {
   string fbs = script_path("fallback_text_string.sh");
   if (file_exists(fbs))
     for (auto& f : FALLBACK_FIXTURES) {
+      if (f.fix && !kTakeFixes) continue;
       string d = fb_fixture_dir(tmp, f);
       CmdResult c = run_capture({fbs}, 600, d);
       string shell_uid = c.out.empty() ? "" : trim(split_lines(c.out)[0]);
@@ -3701,8 +3737,8 @@ static void st_view_and_config() {
         while (now_s() < until) { char buf[4096]; ssize_t n = read(m, buf, sizeof(buf)); if (n > 0) seen.append(buf, (size_t)n); else usleep(100000); }
         size_t mark = seen.size();                          // P, the old key, still resumes
         { ssize_t n = write(m, "P", 1); (void)n; }
-        until = now_s() + 2;
-        while (now_s() < until) { char buf[4096]; ssize_t n = read(m, buf, sizeof(buf)); if (n > 0) seen.append(buf, (size_t)n); else usleep(100000); }
+        until = now_s() + 8;
+        while (now_s() < until && seen.find("resume asked", mark) == string::npos) { char buf[4096]; ssize_t n = read(m, buf, sizeof(buf)); if (n > 0) seen.append(buf, (size_t)n); else usleep(100000); }
         bool p_resumes = seen.find("resume asked", mark) != string::npos;
         ssize_t n = write(m, "q", 1); (void)n;
         int st = -1, waited = 0;

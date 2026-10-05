@@ -397,6 +397,7 @@ int cmd_run(const Args& a) {
         st.consecutive_fail[s.build] = 0;
       }
       string uid = kv.count("uid") ? kv["uid"] : (kv.count("text") ? kv["text"] : "");
+      if (kv.count("savefail")) uid += " [not saved: " + replace_all(kv["savefail"], "_", " ") + "]";   // the ledger says why the trial stayed where it was
       string dir = kv.count("dir") ? kv["dir"] : "";
       logline("[T%zu] trial %ld %s %s: %s%s%s", (size_t)(&s - &S[0]), s.trial, s.build.c_str(), kv["area"].c_str(), outcome.c_str(), dir.empty() ? "" : (" " + dir).c_str(), uid.empty() ? "" : (" " + uid).c_str());
       ledger_append("trial", fmt("%ld %s %s %s %s", s.trial, s.build.c_str(), kv["area"].c_str(), outcome.c_str(), uid.c_str()));

@@ -180,11 +180,28 @@ bool text_has_san_marker(const string& t) {
          icontains(t, "LeakSanitizer:") || icontains(t, "MemorySanitizer:");
 }
 
+// The line of a failed backup step's output that says what failed: the first one with error, failed, cannot or
+// can't in it, since the cause comes before what follows from it ("finished with error", the shutdown). A prompt
+// line ("$ ...") and a server [Note] do not count. The last line when none says so.
+string backup_failure_line(const string& out) {
+  string last;
+  for (auto& l : split_lines(out)) {
+    string t = trim(l);
+    if (t.empty()) continue;
+    last = t;
+    if (starts_with(t, "$ ") || t.find("[Note]") != string::npos) continue;
+    string lo = lower(t);
+    if (lo.find("error") != string::npos || lo.find("failed") != string::npos || lo.find("cannot") != string::npos || lo.find("can't") != string::npos) return t;
+  }
+  return last;
+}
+
 // a backup issue as a UID: the step, then its message with every number made N and the
-// [NN] YYYY-MM-DD HH:MM:SS prefix of a mariadb-backup line taken off, so one cause is one UID
+// [NN] YYYY-MM-DD HH:MM:SS prefix of a mariadb-backup line taken off, so one cause is one UID. A Windows tool
+// says mariadb-backup.exe where a Linux one says mariadb-backup: the .exe is not part of the cause
 string backup_issue_uid(const string& step, const string& message) {
   string m;
-  for (char c : message) { if (isdigit((unsigned char)c)) { if (m.empty() || m.back() != 'N') m += 'N'; } else m += c; }
+  for (char c : strip_exe_names(message)) { if (isdigit((unsigned char)c)) { if (m.empty() || m.back() != 'N') m += 'N'; } else m += c; }
   size_t at = !m.empty() && m[0] == '[' ? m.find("] ") : string::npos;
   if (at != string::npos) { size_t s = m.find_first_not_of("N-: ", at + 2); m = s == string::npos ? "" : m.substr(s); }
   return "BACKUP_ISSUE|" + step + "|" + m.substr(0, 200);
@@ -418,7 +435,7 @@ int role_trial(const Args& a) {
     string why, skip;
     auto judge = [&](const string& what, int rc, const string& out) {
       if (rc == 0) return true;
-      string last = trim(tail_lines(out, 1));
+      string last = kTakeFixes ? backup_failure_line(out) : trim(tail_lines(out, 1));   // Linux names the last line until it is decided
       if (root_turned_away(out)) skip = what + ": " + last;
       else if (rc == -1 || rc == 124) { why = what + fmt(" did not finish within %d s", BACKUP_STEP_TIMEOUT_S); backup_uid = backup_issue_uid(what, "hang"); }
       else { why = what + fmt(" ended %d: ", rc) + last; backup_uid = backup_issue_uid(what, last); }
@@ -654,7 +671,11 @@ int role_trial(const Args& a) {
       dir_note = " dir=" + final_dir;
     } else {
       outcome = "save-failed";
-      dir_note = " dir=" + tdir + " text=" + why;
+      // the event's text= takes the rest of the line, so the uid after it was lost: the reason goes in a key of its own
+      string w = why;
+      for (char& c : w) if (c == ' ') c = '_';
+      dir_note = kTakeFixes ? " dir=" + tdir + " savefail=" + w : " dir=" + tdir + " text=" + why;
+      if (kTakeFixes) write_file(tdir + "/SAVE_FAILED", why + "\n");     // the dir stays where it is: a person is told why
     }
   } else {
     discard_trial();

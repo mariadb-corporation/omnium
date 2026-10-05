@@ -103,10 +103,10 @@ string per_line(const string& text, const std::function<string(const string&)>& 
 // mariadbd.exe: Table ..." for the "[ERROR] mariadbd: Table ..." that REGEX_ERRORS_SCAN and
 // REGEX_ERRORS_FILTER, uid_prefix and every rule below are written against. s/mariadbd.exe/mariadbd/ is
 // done once, as the lines are read, so that nothing past that point has to know the name. The same for
-// mysqld.exe, and for the client names mariadb.exe and mysql.exe.
-string strip_exe_names(const string& l) {
+// mysqld.exe, for the client names mariadb.exe and mysql.exe and for the backup tool's.
+string without_exe_names(const string& l) {
   if (!icontains(l, ".exe")) return l;
-  RXI(exe, "\\b(mariadbd|mariadb|mysqld|mysql)\\.exe\\b");
+  RXI(exe, "\\b(mariadbd|mariadb-backup|mariabackup|mariadb|mysqld|mysql)\\.exe\\b");
   return exe.sub(l, "$1", true);
 }
 // the lines grep sees: every line, a final one without a newline included
@@ -121,7 +121,7 @@ vector<string> grep_lines(const string& text) {
   }
   for (auto& l : v) {
     if (!l.empty() && l.back() == '\r') l.pop_back();   // a Windows error log ends its lines in CRLF
-    l = strip_exe_names(l);                             // and names its server mariadbd.exe
+    l = without_exe_names(l);                           // and names its server mariadbd.exe
   }
   return v;
 }
@@ -215,6 +215,9 @@ string cap_copy_dir() {
   return g_cap_dir;
 }
 }  // namespace
+
+// s/mariadbd.exe/mariadbd/ and the like, for a text that is not read through grep_lines (a backup tool's output)
+string strip_exe_names(const string& text) { return without_exe_names(text); }
 
 vector<string> capped_logs(const vector<string>& logs) {
   vector<string> out;
@@ -1033,7 +1036,7 @@ string uid_fallback(const string& log_in, string* err) {
       s = r6.sub(s, "", false);
       s = replace_all(s, "DUMMY", " ");
       s = r7.sub(s, "", false);
-      s = fts_dots_main(s);
+      s = kTakeFixes ? fts_dots_main(s) : fts_dots(s);        // Linux keeps the port's dots for : and | until it is decided
       if (blank.hit(s)) continue;
       text = rtrim.sub(ltrim.sub(s, "", false), "", false);
       break;
