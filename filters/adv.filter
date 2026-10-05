@@ -1,0 +1,1 @@
+debug_dbug|debug_|_debug|debug[ \t]*=|'\+d,|shutdown|release|kill|aria_encrypt_tables|_size|length_|_length|timer|schedule|event|csv|recursive|oracle|track_system_variables|^#|^\-\-|set.*ndb_|^let|^[ \t]*$

@@ -1,0 +1,6 @@
+# Sanitizer options for every server omnium starts: trials, reduction, matrix and MTR alike.
+# One KEY=VALUE per line. QA_DIR expands to the mariadb-qa checkout (the suppression files live there).
+ASAN_OPTIONS=suppressions=QA_DIR/ASAN.filter:quarantine_size_mb=512:atexit=0:detect_invalid_pointer_pairs=3:dump_instruction_bytes=1:abort_on_error=1:allocator_may_return_null=1
+UBSAN_OPTIONS=suppressions=QA_DIR/UBSAN.filter:print_stacktrace=1:report_error_type=1
+TSAN_OPTIONS=suppressions=QA_DIR/TSAN.filter:suppress_equal_stacks=1:history_size=7:second_deadlock_stack=1:verbosity=1
+MSAN_OPTIONS=abort_on_error=1:poison_in_dtor=0
