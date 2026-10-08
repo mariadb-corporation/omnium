@@ -1201,8 +1201,10 @@ string uid_other_strings(const vector<string>& logs) {
       RX(c1, "^mariadbd: ");
       RX(c2, "^mysqld: ");
       RX(c3, "Table /[^#]+#sql-temptable[^ ]+ ");
+      RX(c3w, "Table [^#]*\\\\#sql-temptable[^ ]+ ");       // a Windows path to the temporary table, C:\...\tmp\#sql-temptable-...
       RX(c4, "Table t[0-9]+ is marked as crashed");
       string t = c3.sub(c2.sub(c1.sub(strip_quotes(s), "", false), "", false), "Table sql-temptable-X ", false);
+      t = c3w.sub(t, "Table sql-temptable-X ", false);
       return c4.sub("MARKED_AS_CRASHED|" + t, "Table X is marked as crashed", true);
     }
   }
@@ -1539,11 +1541,15 @@ string windows_signal(const string& code_in) {
 // destructor, X::`scalar deleting destructor', is gdb's second X::~X frame (the destructor of a Foo<int> is
 // Foo<int>::~Foo); the standard library's atomic storage, std::_Atomic_storage<T,N>, is libstdc++'s
 // std::__atomic_base<T>, the frame an atomic load or store fails in; an anonymous namespace is
-// `anonymous namespace' to MSVC and (anonymous namespace) to gdb. How a template argument is spelled is
-// not renamed here, since a 64 cannot be told from gdb's 64u: the known-bugs match reads both as one.
+// `anonymous namespace' to MSVC and (anonymous namespace) to gdb; and the thread entry of the pthread
+// emulation, pthread_start, is glibc's start_thread (the clone below it is the frame gdb adds after it, and
+// a UID that stops at start_thread is a prefix of the list's line, which the match finds). How a template
+// argument is spelled is not renamed here, since a 64 cannot be told from gdb's 64u: the known-bugs match
+// reads both as one.
 static string windows_frame_name(string s) {
   RX(dtor, "^(.+)::`(?:scalar|vector) deleting destructor'$");
   RX(atomic, "^std::_Atomic_storage<(.+),[0-9]+>(::.+)$");
+  if (s == "pthread_start") return "start_thread";
   if (dtor.hit(s)) {
     string cls = dtor.sub(s, "$1", false), bare;
     int depth = 0;

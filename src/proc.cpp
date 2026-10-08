@@ -212,6 +212,17 @@ string proc_cmdline(pid_t pid) {
   for (auto& ch : c) if (ch == 0) ch = ' ';
   return trim(c);
 }
+long proc_cpu_ms(pid_t pid) {
+  if (pid <= 0) return -1;
+  string s = read_file(fmt("/proc/%d/stat", (int)pid));
+  size_t rp = s.rfind(')');
+  if (rp == string::npos) return -1;
+  vector<string> f = split_ws(s.substr(rp + 1));               // state ppid pgrp session tty tpgid flags 4 fault counts, then utime and stime
+  if (f.size() < 13) return -1;
+  long hz = sysconf(_SC_CLK_TCK);
+  if (hz <= 0) hz = 100;
+  return (to_long(f[11]) + to_long(f[12])) * 1000 / hz;
+}
 uint64_t proc_rss_bytes(pid_t pid) {
   string s = read_file(fmt("/proc/%d/status", (int)pid));
   for (auto& l : split_lines(s))

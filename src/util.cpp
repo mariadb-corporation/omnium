@@ -121,6 +121,17 @@ string read_file(const string& path) {
   fclose(fp);
   return out;
 }
+string read_file_from(const string& path, int64_t from) {
+  FILE* fp = fopen(path.c_str(), "rb");
+  if (!fp) return {};
+  if (from > 0 && fseeko(fp, (off_t)from, SEEK_SET) != 0) { fclose(fp); return {}; }
+  string out;
+  char buf[65536];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) out.append(buf, n);
+  fclose(fp);
+  return out;
+}
 bool write_file(const string& path, std::string_view content) {
   static std::atomic<unsigned> seq{0};                          // two threads writing one path get two temporaries
   string tmp = path + ".tmp" + std::to_string(getpid()) + "_" + std::to_string(++seq);
@@ -129,7 +140,11 @@ bool write_file(const string& path, std::string_view content) {
   bool ok = fwrite(content.data(), 1, content.size(), fp) == content.size();
   ok = (fclose(fp) == 0) && ok;
   if (!ok) { unlink(tmp.c_str()); return false; }
-  if (rename(tmp.c_str(), path.c_str()) != 0) { unlink(tmp.c_str()); return false; }
+  int rc = rename(tmp.c_str(), path.c_str());
+  // Windows refuses a rename onto a file that another thread is just replacing or has open, and lets go at once: try again
+  if (kHostMsys2)
+    for (int i = 0; rc != 0 && (errno == EACCES || errno == EBUSY || errno == EPERM) && i < 40; i++) { usleep(50000); rc = rename(tmp.c_str(), path.c_str()); }
+  if (rc != 0) { unlink(tmp.c_str()); return false; }
   return true;
 }
 bool append_file(const string& path, std::string_view content) {
@@ -294,6 +309,16 @@ string native_option(const string& opt) {
   string n = native_path(v);
   return n.empty() ? opt : opt.substr(0, eq + 1) + pre + n;
 }
+bool same_path(const string& a, const string& b) {
+  auto norm = [](string p) {
+    string n = native_path(p);                                    // an MSYS2 path as the server's Windows spelling
+    if (!n.empty()) p = n;
+    for (char& c : p) c = c == '\\' ? '/' : (kHostMsys2 ? (char)tolower((unsigned char)c) : c);
+    while (p.size() > 1 && p.back() == '/') p.pop_back();
+    return p;
+  };
+  return norm(a) == norm(b);
+}
 string user_home() {
   string h = home_dir(), w = windows_home();
   if (w.empty()) return h;
@@ -301,6 +326,22 @@ string user_home() {
   // person's, wins
   struct passwd* pw = getpwuid(getuid());
   return pw && pw->pw_dir && h == pw->pw_dir ? w : h;
+}
+string msys2_home_fix(const string& home, const string& profile, const string& msys_home, bool home_has_conf, bool msys_has_conf) {
+  if (home.empty() || profile.empty() || msys_home.empty() || home == msys_home || home != profile) return "";
+  if (home_has_conf || !msys_has_conf) return "";
+  return msys_home;
+}
+void fix_msys2_home() {
+  if (!kHostMsys2) return;
+  const char* h = getenv("HOME");
+  struct passwd* pw = getpwuid(getuid());
+  if (!h || !*h || !pw || !pw->pw_dir) return;
+  string home = h, real = pw->pw_dir;
+  string use = msys2_home_fix(home, windows_home(), real, file_exists(home + "/.omnium.conf"), file_exists(real + "/.omnium.conf"));
+  if (use.empty()) return;
+  setenv("HOME", use.c_str(), 1);
+  fprintf(stderr, "omnium: HOME was %s, the Windows profile with no settings file; using the MSYS2 home %s, which has one\n", home.c_str(), use.c_str());
 }
 string default_pat_file(const string& home) {
   string mine = home + "/.omnium_jira_pat", theirs = home + "/.config/mariadb-qa/jira.pat";
@@ -683,9 +724,14 @@ bool move_tree(const string& from, const string& to, string* why) {
   // Windows will not rename a folder with a file in it that another process has open (the minidump of a crashed server,
   // still being written or scanned, is one) and lets go within seconds, so the rename is tried again for half a minute
   if (kHostMsys2)
-    for (int i = 0; ec && (ec.value() == EACCES || ec.value() == EBUSY || ec.value() == EPERM) && i < 120; i++) { usleep(250000); fs::rename(from, to, ec); }
+    for (int i = 0; ec && (ec.value() == EACCES || ec.value() == EBUSY || ec.value() == EPERM) && i < 40; i++) { usleep(250000); fs::rename(from, to, ec); }
   if (!ec) return true;
-  if (ec.value() != EXDEV) { if (why) *why = ec.message(); return false; }
+  // The folder of a crashed server can stay locked for much longer than that: the crashed process, held by Windows Error
+  // Reporting, still has it as its working directory. Copying works, so it is copied, and what cannot be removed yet goes
+  // when the lock does (the run removes its folder on the tmpfs at its end).
+  bool locked = kHostMsys2 && (ec.value() == EACCES || ec.value() == EBUSY || ec.value() == EPERM);
+  if (ec.value() != EXDEV && !locked) { if (why) *why = ec.message(); return false; }
   if (!copy_tree(from, to, why)) return false;
+  if (locked) { for (int i = 0; i < 5 && !remove_tree(from); i++) sleep(1); return true; }
   return remove_tree(from);
 }

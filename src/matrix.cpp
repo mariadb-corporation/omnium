@@ -107,7 +107,7 @@ void sweep_one(const string& sql_file, size_t statements, const string& options,
   // a Windows release server can die with no banner in its log and no minidump (a failed /GS stack cookie check, a
   // __fastfail): the way it ended is all there is, and "No bug found" would hide a crash
   bool silent = uid == "No bug found" && inst.silent_death();
-  if (silent) { uid = inst.silent_death_uid(); row.note = "the server ended on its own with no crash banner and no minidump"; }
+  if (silent) { uid = inst.silent_death_uid(); row.note = "the server ended on its own with no crash banner and no minidump" + inst.silent_death_note(); }
   if (timed_out && uid == "No bug found") uid = "No result (hang: the client timed out)";
   row.uid = uid;
   row.crashed = inst.has_core() || inst.has_dump() || silent || r.san;
@@ -127,6 +127,7 @@ bool row_less(const MatrixRow& a, const MatrixRow& c) {
   if (a.b.flavour != c.b.flavour) return (int)a.b.flavour < (int)c.b.flavour;
   return a.b.dbg && !c.b.dbg;                                 // dbg before opt
 }
+bool matrix_row_shows_bug(const MatrixRow& r) { return r.uid != "No bug found" && !starts_with(r.uid, "No result"); }
 
 bool matrix_builds(const vector<string>& names, vector<Basedir>& out, string* err) {
   out.clear();

@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include "connect.h"
+#include "winproc.h"
 
 // ---- name grammar ----------------------------------------------------------------------------
 // [FLAVOUR_][TAG_](E?MD|MS|PS)<ddmmyy>-(mariadb|mysql|percona-server)-<version>-linux-x86_64-(opt|dbg)
@@ -413,9 +414,47 @@ string template_for(const Basedir& b, const string& myinit, const string& templa
 }
 
 // ---- ports ------------------------------------------------------------------------------------
+// MSYS2: the bind the server makes, on the wildcard address with no SO_REUSEADDR (it leaves that off on Windows, where it would
+// let a second server take a port over). A listening server and a connection's source port both refuse that bind. The probe on
+// 127.0.0.1 that Linux makes is told "free" by both, so a picked port could be one a server has.
+bool port_free(int port) {
+  int fd = socket(AF_INET6, SOCK_STREAM, 0);
+  if (fd >= 0) {
+    int off = 0;
+    setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));            // the dual stack, as the server's `::`
+    struct sockaddr_in6 a{};
+    a.sin6_family = AF_INET6;
+    a.sin6_addr = in6addr_any;
+    a.sin6_port = htons((uint16_t)port);
+    bool ok = bind(fd, (struct sockaddr*)&a, sizeof(a)) == 0;
+    int why = errno;
+    close(fd);
+    if (ok) return true;
+    if (why == EADDRINUSE || why == EACCES) return false;                      // held, or kept back by Windows (an excluded port range)
+    // any other refusal is the box having no IPv6 to bind: the server falls back to 0.0.0.0, and so does this
+  }
+  fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return false;
+  struct sockaddr_in a{};
+  a.sin_family = AF_INET;
+  a.sin_addr.s_addr = htonl(INADDR_ANY);
+  a.sin_port = htons((uint16_t)port);
+  bool ok = bind(fd, (struct sockaddr*)&a, sizeof(a)) == 0;
+  close(fd);
+  return ok;
+}
 // A bind() probe on 127.0.0.1 in [13001, 65000]; 10001-13000 stay for the basedir helpers.
+// MSYS2: the server's own bind (port_free) in [13001, 49151]. Windows hands the ports from 49152 up to its clients, and the
+// connections of a run take them at any moment: a server that picked one there lost it to a client before it could bind.
 int port_pick() {
   Xoshiro256pp r = rng();
+  if (kHostMsys2) {
+    for (int i = 0; i < 500; i++) {
+      int port = (int)r.range(13001, 49151);
+      if (port_free(port)) return port;
+    }
+    return 0;
+  }
   for (int i = 0; i < 500; i++) {
     int port = (int)r.range(13001, 65000);
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -476,7 +515,16 @@ bool Instance::alive() {
   if (pid <= 0) return false;
   int st;
   pid_t r = waitpid(pid, &st, WNOHANG);
-  if (r == pid) { pid = -1; if (!stopping) exit_status = st; return false; }
+  if (r == pid) {
+    pid = -1;
+    if (!stopping) {
+      exit_status = st;
+      win_status_known = winproc_exit_status(win_handle, &win_status);          // the NTSTATUS that Cygwin turned into a signal or into 127
+    }
+    winproc_close(win_handle);
+    win_handle = 0;
+    return false;
+  }
   return kill(pid, 0) == 0;
 }
 bool Instance::silent_death() const {
@@ -485,8 +533,19 @@ bool Instance::silent_death() const {
   return !has_dump();                                                              // a minidump says it crashed the ordinary way
 }
 string Instance::silent_death_uid() const {
+  if (win_status_known) return fmt("CRASH_NO_LOG|exit code 0x%08X", (unsigned)win_status);
   int code = WIFEXITED(exit_status) ? WEXITSTATUS(exit_status) : 128 + WTERMSIG(exit_status);
   return fmt("CRASH_NO_LOG|exit status %d", code);
+}
+string Instance::silent_death_note() const {
+  if (!win_status_known) return "";
+  switch (win_status) {
+    case 0xC00000FD: return " (a stack overflow)";
+    case 0xC0000409: return " (a failed stack cookie check or __fastfail)";
+    case 0xC0000005: return " (an access violation that the crash handler did not report, which is how a stack overflow of the server can end)";
+    case 0xC0000374: return " (heap corruption found by the Windows heap)";
+    default: return "";
+  }
 }
 bool Instance::start_fresh(const string& tpl, int timeout_s) {
   mkdirs(root); mkdirs(logdir);
@@ -506,38 +565,74 @@ bool Instance::start_only(int timeout_s) {
   start_failed = false;
   stopping = false;
   exit_status = -1;
+  winproc_close(win_handle);
+  win_handle = 0;
+  win_status_known = false;
   start_note.clear();
   // The server changes to its datadir at startup, so a core lands there. The trial worker moves
   // it to /data as soon as the server is gone.
+  log_from = std::max<int64_t>(0, file_size(errlog));           // a restart appends to the log of the start before it
   pid = spawn_program(argv(), errlog, datadir, true, san_env_for(*bd), !detached);
   if (pid <= 0) { start_failed = true; start_note = "fork failed"; return false; }
   set_oom_score(pid, 500);                                      // Q201: short of memory, the kernel takes a server first
   bool ok = wait_ready(timeout_s);
   if (!ok) start_failed = true;
+  // Windows: a handle to the native server, now that it is up (before that the Cygwin pid is the stub that execs it), so the
+  // NTSTATUS of its death can be read later; Cygwin only passes on signal 11 or 127
+  else if (bd && bd->windows) win_handle = winproc_open(pid, basename_of(bd->bin).c_str());
   return ok;
 }
 // the server gave up at startup: "[ERROR] Aborting", or "[ERROR] [MY-010119] [Server] Aborting" on MySQL 8.0+
 bool log_aborted(const string& log) {
   return log.find("ERROR] Aborting") != string::npos || log.find("[MY-010119]") != string::npos;
 }
+bool server_log_ready(const string& log) { return log.find("ready for connections") != string::npos; }
+bool port_clash_in_log(const string& log) {
+  return icontains(log, "Address already in use") ||                // Linux
+         icontains(log, "Only one usage of each socket address") || // Windows, WSAEADDRINUSE: "Can't start server: Bind on TCP/IP port. Got error: 10048: ..."
+         icontains(log, "Got error: 10048");
+}
+// whether the server behind a connection has this datadir: the answer of a port that two servers claim says which one it is
+static bool answers_for_datadir(MYSQL* m, const string& datadir) {
+  if (mysql_query(m, "SELECT @@datadir")) return false;
+  MYSQL_RES* res = mysql_store_result(m);
+  if (!res) return false;
+  MYSQL_ROW row = mysql_fetch_row(res);
+  bool same = row && row[0] && same_path(row[0], datadir);
+  mysql_free_result(res);
+  return same;
+}
 bool Instance::wait_ready(int timeout_s) {
-  double deadline = now_ms() + timeout_s * 1000.0;
+  double t0 = now_ms(), deadline = t0 + timeout_s * 1000.0;
   unsigned last_err = 0;
   string last_msg;
+  bool foreign = false;
   while (now_ms() < deadline) {
     if (!alive()) { start_note = "server exited during start"; return false; }
-    if (tcp || access(sock.c_str(), F_OK) == 0) {
+    // A server that is found by its port is not told from another that holds the port: a start that lost the port dies at the
+    // bind, and a probe in that second talks to whoever has it, succeeds, and the trial runs its SQL on a server that is not its
+    // own while its own is gone. So a TCP server counts once its own log, from where this start began, says it listens; a bind
+    // that failed never prints that. A log that never says it (a start with no notes) is trusted after a while, and the answer
+    // then has to come from this server's datadir.
+    bool own = !tcp || server_log_ready(read_file_from(errlog, log_from));
+    bool late = tcp && !own && now_ms() - t0 > 20000;
+    if (tcp ? (own || late) : access(sock.c_str(), F_OK) == 0) {
       MYSQL* m = mysql_init(nullptr);
       unsigned t = 10;
       mysql_options(m, MYSQL_OPT_CONNECT_TIMEOUT, &t);
       if (endpoint_connect(m, endpoint(), "root", nullptr, 0)) {
-        // not every install-db makes a test database (ES does not), and every replay expects one
-        mysql_query(m, "CREATE DATABASE IF NOT EXISTS test");
-        mysql_close(m);
-        return true;
+        if (!tcp || own || answers_for_datadir(m, datadir)) {
+          // not every install-db makes a test database (ES does not), and every replay expects one
+          mysql_query(m, "CREATE DATABASE IF NOT EXISTS test");
+          mysql_close(m);
+          return true;
+        }
+        foreign = true;                                          // somebody else's server: no database of it is touched
+        last_err = 0;
+      } else {
+        last_err = mysql_errno(m);
+        last_msg = mysql_error(m);
       }
-      last_err = mysql_errno(m);
-      last_msg = mysql_error(m);
       mysql_close(m);
     }
     // a start that already failed on an option says so in the log; no point in waiting on
@@ -556,7 +651,8 @@ bool Instance::wait_ready(int timeout_s) {
     }
     usleep(100000);
   }
-  start_note = last_err ? fmt("connect kept failing: %u %s", last_err, last_msg.c_str()) : fmt("not ready within %d s", timeout_s);
+  start_note = foreign ? fmt("port %d is answered by another server than this one", port)
+             : last_err ? fmt("connect kept failing: %u %s", last_err, last_msg.c_str()) : fmt("not ready within %d s", timeout_s);
   return false;
 }
 bool Instance::shutdown(int timeout_s, string* note) {
@@ -591,6 +687,21 @@ bool Instance::shutdown(int timeout_s, string* note) {
     }
     usleep(100000);
   }
+  // Windows, a loaded box: a server that is still working is not hung. Sixteen trials and the reducers share the cores,
+  // and a server that stops in 4 s on an idle box takes longer than the limit then; such a trial was saved as a shutdown
+  // timeout (18 of the first 1072 of a run). A hung server does nothing, so while its CPU time moves the wait goes on,
+  // 30 s at a time up to five times; one that used under half a second of CPU in 30 s is a hang.
+  if (!gone && kTakeFixes && bd->windows) {
+    long used = proc_cpu_ms(pid);
+    for (int round = 0; round < 5 && !gone && used >= 0; round++) {
+      double end = now_ms() + 30000;
+      while (!gone && now_ms() < end) { if (!alive()) gone = true; else usleep(100000); }
+      if (gone) break;
+      long now = proc_cpu_ms(pid);
+      if (now < 0 || now - used < 500) break;
+      used = now;
+    }
+  }
   if (ap > 0 && arc == -1) { arc = wait_pid(ap, 0); if (arc == -1) { kill(ap, SIGKILL); wait_pid(ap, 3000); } }
   if (note) {
     string out = trim(read_file(alog));
@@ -607,6 +718,8 @@ void Instance::kill_hard() {
   kill_group(pid, SIGKILL);
   wait_pid(pid, 10000);
   pid = -1;
+  winproc_close(win_handle);
+  win_handle = 0;
 }
 // the test tree of a build: MariaDB names it mariadb-test, older and MySQL builds mysql-test
 string basedir_test_dir(const Basedir& b) {

@@ -80,6 +80,26 @@ bool root_turned_away(const string& text) {
          icontains(text, "init_connect") || icontains(text, "Too many connections") ||
          (kTakeFixes && icontains(text, "is not allowed to connect"));                 // error 1130: the user's host was taken away
 }
+// The statement a silent death ended on, as its first two words (DROP TABLE, WITH RECURSIVE), for the per-UID cap: a frameless
+// UID is shared by every cause that kills a server without a banner, and the cap would keep the first cause only. It is the
+// last statement of the first thread, as a trial with several threads does not say which of them did it.
+string silent_death_statement(const string& tdir) {
+  string last;
+  for (auto& l : split_lines(read_file(tdir + "/default.node.tld_thread-0.last.sql"))) if (!trim(l).empty()) last = trim(l);
+  string out;
+  size_t i = 0;
+  int words = 0;
+  while (i < last.size() && words < 2) {
+    while (i < last.size() && (isspace((unsigned char)last[i]) || last[i] == '(')) i++;
+    size_t j = i;
+    while (j < last.size() && !isspace((unsigned char)last[j])) j++;
+    string clean;
+    for (char c : upper(last.substr(i, j - i))) if (isalnum((unsigned char)c) || c == '_' || c == '*') clean += c;
+    if (!clean.empty()) { out += (out.empty() ? "" : " ") + clean; words++; }
+    i = j;
+  }
+  return out;
+}
 // An encrypted backup (the server ran with the file key management plugin) is prepared with the backup's own
 // backup-my.cnf, which holds the key plugin and its files: --no-defaults leaves them out, and srv_start() then
 // ends 11. The backup tool does not take the plugin options on its command line ("unknown variable").
@@ -102,7 +122,8 @@ long saved_with_uid(const string& workdir, const string& uid, const string& exce
   std::error_code ec;
   for (auto& e : fs::directory_iterator(workdir, ec)) {
     if (!e.is_directory(ec) || e.path().string() == except_dir) continue;
-    string mb = e.path().string() + "/MYBUG";
+    string mb = e.path().string() + "/DUP_KEY";                 // a silent death keeps its own key: the UID alone is shared by every cause
+    if (!file_exists(mb)) mb = e.path().string() + "/MYBUG";
     if (!file_exists(mb)) continue;
     string u = read_file(mb);
     size_t nl = u.find('\n');
@@ -333,7 +354,11 @@ int role_trial(const Args& a) {
       remove_tree(inst.datadir);                                  // the copy of the template says nothing
       string why = inst.start_note;
       if (log_aborted(log)) {
-        if (icontains(log, "Address already in use")) { discard_trial(); role_emit("result outcome=port-clash " + base_ev); return 0; }
+        if (port_clash_in_log(log)) {
+          discard_trial();
+          role_emit("result outcome=port-clash " + base_ev + (kTakeFixes ? fmt(" text=port %d was taken before the server could bind it", inst.port) : ""));
+          return 0;
+        }
         if (icontains(log, "Can't initialize timers")) { discard_trial(); role_emit("result outcome=dropped-timers " + base_ev); return 0; }
         // a start that failed on a server option is a configured value, not a bug: the trial goes
         static const char* opt_refusals[] = {"unknown variable", "error while setting value", "unknown option", "requires innodb_buffer_pool_size",
@@ -377,7 +402,7 @@ int role_trial(const Args& a) {
   std::thread ct;
   if (started) ct = std::thread([&] { client_ok = client_run(cp, infile, stop, cr, &client_err); client_done = true; });
   double deadline = now_ms() + seconds * 1000.0;
-  bool crash_done = false, recovery_failed = false, server_died = false;
+  bool crash_done = false, recovery_failed = false, server_died = false, restart_port_clash = false;
   // backup trials: the full backup runs against the busy server; the rest of the round trip follows the
   // window. The backup and the restored server sit beside the datadir, so on DATA_DIR when the trial is.
   string bk_home = data_core ? final_dir : tdir, bk_log = tdir + "/log/backup.log";
@@ -400,6 +425,8 @@ int role_trial(const Args& a) {
       if (!inst.start_only(start_timeout)) {
         // the server recovered and the trial's own SQL had turned root away: a configured state, not a recovery failure
         if (kTakeFixes && root_turned_away(inst.start_note)) { logline("trial %ld: crash recovery: the server turns root away, %s", trial, inst.start_note.c_str()); break; }
+        // the port went to another server while this one was down: nothing was recovered or tested, no finding either way
+        if (kTakeFixes && port_clash_in_log(read_file_from(inst.errlog, inst.log_from))) { restart_port_clash = true; break; }
         recovery_failed = true;
         write_file(tdir + "/CRASH_RECOVERY_ISSUE", inst.start_note + "\n");
         break;
@@ -423,6 +450,14 @@ int role_trial(const Args& a) {
     for (int i = 0; i < 50 && !client_done; i++) usleep(100000);
   }
   sleep(b.is_san() ? 5 : 3);
+  if (restart_port_clash) {
+    logline("trial %ld: crash recovery: port %d was taken while the server was down, the trial is dropped", trial, inst.port);
+    inst.kill_hard();
+    if (ct.joinable()) ct.join();
+    discard_trial();
+    role_emit("result outcome=port-clash " + base_ev + fmt(" text=port %d was taken while the server was down", inst.port));
+    return 0;
+  }
   // backup trials: the round trip. With the data at rest its checksums are taken, an incremental backup
   // brings the full backup of the busy server up to them, both are prepared, a server starts on the
   // result and its checksums are compared. A step that fails, or a difference, is kept as BACKUP_ISSUE.
@@ -482,7 +517,15 @@ int role_trial(const Args& a) {
       if (!move_tree(full, ri.datadir, &mvwhy)) { why = "the prepared backup could not be moved into place: " + mvwhy; ok = false; }
       else {
         ri.port = port_pick();
-        if (!ri.start_only(start_timeout)) {
+        bool up = ri.start_only(start_timeout);
+        // the port went to another server between the pick and the bind: nothing in this server names its port, so another is tried
+        for (int retry = 0; !up && kTakeFixes && retry < 2 && port_clash_in_log(read_file_from(ri.errlog, ri.log_from)); retry++) {
+          logline("trial %ld: the server on the restored data lost port %d, another is tried", trial, ri.port);
+          ri.kill_hard();
+          ri.port = port_pick();
+          up = ri.start_only(start_timeout);
+        }
+        if (!up) {
           ok = false;
           if (root_turned_away(ri.start_note)) skip = "the server on the restored data: " + ri.start_note;
           else { why = "the server did not start on the restored data: " + ri.start_note; backup_uid = backup_issue_uid("the server did not start on the restored data", ri.start_note); }
@@ -613,6 +656,9 @@ int role_trial(const Args& a) {
     // a Windows release server that died with no banner and no minidump: its exit status is the UID, as the frames are a crash's
     uid = inst.silent_death_uid();
     write_file(tdir + "/MYBUG", uid + "\n");
+    write_file(tdir + "/SILENT_DEATH", "the server ended on its own with no crash banner and no minidump" + inst.silent_death_note() + "\n");
+    string stmt = silent_death_statement(tdir);                 // the cap per UID counts a cause once, not every cause of a frameless UID
+    if (!stmt.empty()) write_file(tdir + "/DUP_KEY", uid + "|" + stmt + "\n");
     if (uid_known(uid) && !file_exists(tdir + "/ERROR_LOG_SCAN_ISSUE")) outcome = "known";
     else { save = true; outcome = "saved-new"; }
   } else if (kTakeFixes && file_exists(tdir + "/ERROR_LOG_SCAN_ISSUE")) {
@@ -649,7 +695,9 @@ int role_trial(const Args& a) {
   if (uid.empty() && save && !errlog_uid.empty()) { uid = errlog_uid; write_file(tdir + "/MYBUG", uid + "\n"); }
   // enough copies of a new bug are kept already: this one is a duplicate
   if (save && (outcome == "saved-new" || outcome == "saved-san" || outcome == "saved-backup") && !uid.empty() && !shutdown_hang && !file_exists(tdir + "/ERROR_LOG_SCAN_ISSUE")) {
-    long have = saved_with_uid(workdir, uid, final_dir);
+    string dup_key = uid;
+    if (file_exists(tdir + "/DUP_KEY")) { dup_key = read_file(tdir + "/DUP_KEY"); dup_key = dup_key.substr(0, dup_key.find('\n')); }
+    long have = saved_with_uid(workdir, dup_key, final_dir);
     if (have >= std::max(1, g_cfg.keep_per_uid)) { save = false; outcome = "dup"; }
   }
   if (!uid.empty()) seen_record(uid, run_id, outcome);

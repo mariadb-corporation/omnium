@@ -240,7 +240,23 @@ static string search_frame(const string& uid, int* pos) {
 // as long where MSVC has __int64. A match reads both sides in one spelling. A UID is never rewritten, and a
 // real 0 (x == 0, the leading 0 of a DBUG_ASSERT(0) UID) stays a 0: only the spellings are made one.
 // Only a Windows box does this: a Linux box has one spelling, so its matching stays as it was.
-static string kb_canon(const string& s) {
+//
+// Two macros read differently as well. A Windows build is never built with WSREP, so WSREP(thd) is (0) in it, and
+// so is wsrep_emulate_bin_log: the list's "((thd && (WSREP_PROVIDER_EXISTS_ && thd->variables.wsrep_on)) &&
+// wsrep_emulate_bin_log) || mysql_bin_log.is_open()" is a Windows UID's "((0) && (0)) || mysql_bin_log.is_open()".
+// And UINT_MAX is glibc's (2147483647 *2U +1U) where MSVC has 0xffffffff.
+static string kb_macros_plain(string s) {
+  static const std::regex wsrep_thd("\\([A-Za-z_][A-Za-z_0-9]* && \\(WSREP_PROVIDER_EXISTS_ && [A-Za-z_][A-Za-z_0-9]*->variables\\.wsrep_on\\)\\)");
+  static const std::regex wsrep_on("\\(WSREP_PROVIDER_EXISTS_ && [A-Za-z_][A-Za-z_0-9]*->variables\\.wsrep_on\\)");
+  if (s.find("WSREP_PROVIDER_EXISTS_") != string::npos) {
+    s = std::regex_replace(s, wsrep_thd, "(0)");
+    s = std::regex_replace(s, wsrep_on, "(0)");
+  }
+  s = replace_all(s, "wsrep_emulate_bin_log", "(0)");
+  return replace_all(s, "(2147483647 *2U +1U)", "0xffffffff");
+}
+static string kb_canon(const string& in) {
+  const string s = kb_macros_plain(in);
   string o;
   o.reserve(s.size());
   const size_t n = s.size();
@@ -274,16 +290,79 @@ static string kb_canon(const string& s) {
 bool kb_line_has(const string& line, const string& uid) {
   return icontains(line, uid) || (kHostMsys2 && icontains(kb_canon(line), kb_canon(uid)));
 }
+// A frame without its template arguments, row_search_mvcc<InnoDBPolicy<1,1> > as row_search_mvcc; false (and nothing
+// to strip) when its brackets do not pair, as those of operator<, operator<< and operator-> do not
+static bool kb_strip_templates(const string& frame, string& bare) {
+  bare.clear();
+  int depth = 0;
+  for (char c : frame) {
+    if (c == '<') depth++;
+    else if (c == '>') { if (!depth) return false; depth--; }
+    else if (!depth) bare += c;
+  }
+  return depth == 0;
+}
 KbMatch kb_search(const string& uid) {
   KbMatch m;
   m.san = kb_uid_is_san(uid);
   m.frame = search_frame(uid, &m.frame_pos);
   string txt = read_file(m.san ? g_paths.known_bugs_san : g_paths.known_bugs);
   string uid_c = kHostMsys2 ? kb_canon(uid) : "", frame_c = kHostMsys2 ? kb_canon(m.frame) : "";
-  for (auto& line : split_lines(txt)) {
+  vector<string> lines = split_lines(txt);
+  vector<string> lines_c;                                      // the lines as kb_canon reads them, on a Windows box
+  for (auto& line : lines) {
     string line_c = kHostMsys2 ? kb_canon(line) : "";
     if (icontains(line, uid) || (kHostMsys2 && icontains(line_c, uid_c))) m.exact.push_back(line);
     if (!m.frame.empty() && (icontains(line, m.frame) || (kHostMsys2 && icontains(line_c, frame_c)))) m.partial.push_back(line);
+    if (kHostMsys2) lines_c.push_back(line_c);
+  }
+  // A Windows frame with template arguments, row_search_mvcc<InnoDBPolicy<1,1> >, where the list has the frame bare,
+  // row_search_mvcc: gdb's output as the list holds it has them in some lines and not in others. So a frame's
+  // arguments are also tried away, in every combination of the frames that have any (a line that has them still
+  // matches by the arguments, a line that has none by the bare frame).
+  if (kHostMsys2 && m.exact.empty()) {
+    vector<string> f = split(uid, '|');
+    size_t sig = 0;
+    while (sig < f.size() && !starts_with(f[sig], "SIG")) sig++;       // the frames follow the signal
+    vector<size_t> with;
+    string bare;
+    for (size_t i = sig + 1; i < f.size(); i++) if (f[i].find('<') != string::npos && kb_strip_templates(f[i], bare) && bare != f[i]) with.push_back(i);
+    if (sig < f.size() && !with.empty() && with.size() <= 4) {
+      for (unsigned mask = 1; mask < (1u << with.size()); mask++) {
+        vector<string> g = f;
+        for (size_t k = 0; k < with.size(); k++) if (mask & (1u << k)) { kb_strip_templates(f[with[k]], bare); g[with[k]] = bare; }
+        string variant_c = kb_canon(join(g, "|"));
+        for (size_t i = 0; i < lines.size(); i++)
+          if (icontains(lines_c[i], variant_c) && std::find(m.exact.begin(), m.exact.end(), lines[i]) == m.exact.end()) m.exact.push_back(lines[i]);
+      }
+    }
+    // and the first frame by itself, bare, as a partial match, when nothing else listed one
+    if (m.partial.empty() && kb_strip_templates(m.frame, bare) && bare != m.frame && !bare.empty()) {
+      string bare_c = kb_canon(bare);
+      for (size_t i = 0; i < lines.size(); i++) if (icontains(lines_c[i], bare_c)) m.partial.push_back(lines[i]);
+    }
+  }
+  // A frameless assertion, ASSERT|<text>, is what a plain assert() leaves in a Windows plugin: the CRT's line and no
+  // frames. The list holds the same assertion as <text>|SIGABRT|frames, so those lines are its entry, when they are one
+  // bug's: <text> followed by |SIGABRT| is exact on the text, and a key (MDEV-n) that every such line carries says that
+  // the text belongs to one bug. A generic text ('length > 0') is several bugs' and says nothing about this one: its
+  // lines are only offered as a partial match. Linux keeps its verdict until it is decided.
+  if (kTakeFixes && m.exact.empty() && starts_with(uid, "ASSERT|") && uid.size() > 7) {
+    string text = uid.substr(7), head = lower(text + "|SIGABRT|");
+    vector<string> hits;
+    for (auto& line : lines) {
+      size_t b = line.find_first_not_of("# \t");
+      if (b != string::npos && starts_with(lower(line.substr(b)), head)) hits.push_back(line);
+    }
+    if (!hits.empty()) {
+      vector<string> common = kb_keys({hits[0]});
+      for (auto& h : hits) {
+        vector<string> ks = kb_keys({h});
+        common.erase(std::remove_if(common.begin(), common.end(), [&](const string& k) { return std::find(ks.begin(), ks.end(), k) == ks.end(); }), common.end());
+      }
+      if (!common.empty()) m.exact = hits;
+      else { m.partial = hits; m.frame = text; m.frame_pos = 0; }
+    }
   }
   return m;
 }
@@ -311,8 +390,12 @@ string kb_verdict_text(const string& uid, const KbMatch& m) {
       out += "BUG NOT FOUND IN KNOWN BUGS LIST! POTENTIALLY NEW BUG TO LOG; SEARCH FIRST:\n";
       break;
     case KbVerdict::Partial:
-      out += fmt("BUG NOT FOUND (IDENTICALLY) IN KNOWN BUGS LIST! POTENTIALLY NEW BUG TO LOG. HOWEVER, A PARTIAL MATCH BASED ON THE %s FRAME ('%s') WAS FOUND, AS FOLLOWS: (PLEASE CHECK IT IS NOT THE SAME BUG):\n",
-                 m.frame_pos == 1 ? "1st" : "2nd", m.frame.c_str());
+      if (m.frame_pos == 0)                                    // a frameless assertion: the text of several bugs' entries
+        out += fmt("BUG NOT FOUND (IDENTICALLY) IN KNOWN BUGS LIST! POTENTIALLY NEW BUG TO LOG. HOWEVER, THE ASSERTION TEXT ('%s'), WHICH HAS NO FRAMES, IS THAT OF THESE ENTRIES, WHICH DO NOT SHARE ONE BUG KEY: (PLEASE CHECK IT IS NOT THE SAME BUG):\n",
+                   m.frame.c_str());
+      else
+        out += fmt("BUG NOT FOUND (IDENTICALLY) IN KNOWN BUGS LIST! POTENTIALLY NEW BUG TO LOG. HOWEVER, A PARTIAL MATCH BASED ON THE %s FRAME ('%s') WAS FOUND, AS FOLLOWS: (PLEASE CHECK IT IS NOT THE SAME BUG):\n",
+                   m.frame_pos == 1 ? "1st" : "2nd", m.frame.c_str());
       out += join(m.partial, "\n") + "\n";
       break;
     case KbVerdict::KnownAndFixed:
@@ -367,10 +450,8 @@ static vector<string> kb_null_readings(const string& a) {
 // brackets do not pair (operator<) comes back whole.
 static vector<string> kb_frame_words(const string& frame) {
   string bare;
-  int depth = 0;
-  for (char c : frame) { if (c == '<') depth++; else if (c == '>') { if (depth) depth--; } else if (!depth) bare += c; }
   vector<string> out;
-  if (depth != 0) { out.push_back(frame); return out; }
+  if (!kb_strip_templates(frame, bare)) { out.push_back(frame); return out; }
   for (size_t p = 0; p <= bare.size();) {
     size_t q = bare.find("::", p);
     string w = trim(bare.substr(p, q == string::npos ? string::npos : q - p));
@@ -389,13 +470,18 @@ vector<string> kb_jira_urls(const string& uid) {
   string fz = f.size() >= 3 ? field_from_end(f, 1, uid) : uid;
   fx = replace_all(replace_all(fx, "MUTEX_ERROR|", ""), "MUTEX_ERROR", "");
   vector<string> urls;
-  urls.push_back(base + "text%20~%20%22%5C%22" + uri_escape(fx) + "%5C%22%22%20and%20text%20~%20%22%5C%22" +
-                 uri_escape(fy) + "%5C%22%22%20and%20text%20~%20%22%5C%22" + uri_escape(fz) + "%5C%22%22" + tail);
+  // a frameless assertion, ASSERT|<text> (what a plain assert() leaves in a Windows plugin), has no frames to search by:
+  // its text is the search, and the URLs by "ASSERT|text" that Linux gets for it find nothing
+  bool frameless = kTakeFixes && starts_with(uid, "ASSERT|") && uid.size() > 7;
+  if (!frameless)
+    urls.push_back(base + "text%20~%20%22%5C%22" + uri_escape(fx) + "%5C%22%22%20and%20text%20~%20%22%5C%22" +
+                   uri_escape(fy) + "%5C%22%22%20and%20text%20~%20%22%5C%22" + uri_escape(fz) + "%5C%22%22" + tail);
   string a = replace_all(uid, "||", "\x01");
   a = a.substr(0, a.find('|'));
   a = replace_all(a, "\x01", "||");
   a = replace_all(replace_all(a, "MUTEX_ERROR|", ""), "MUTEX_ERROR", "");
-  if (!a.empty() && a != "SIGSEGV" && a != "SIGABRT" && !kb_uid_is_san(uid)) {
+  if (frameless) a = uid.substr(7);
+  if (!a.empty() && (frameless || (a != "SIGSEGV" && a != "SIGABRT" && !kb_uid_is_san(uid)))) {
     urls.push_back(base + "text%20~%20%22%5C%22" + uri_escape(a) + "%5C%22%22" + tail);
     string alt;
     if (kHostMsys2)                                            // a Windows box: a 0 may be Jira's __null

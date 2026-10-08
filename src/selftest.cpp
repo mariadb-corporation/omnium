@@ -3,6 +3,8 @@
 // as .failed.
 #include "verbs.h"
 #include "connect.h"
+#include "winterm.h"
+#include "winproc.h"
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <signal.h>
@@ -85,6 +87,18 @@ static void st_util() {
   st_check(write_file(tmp, "abc\n") && read_file(tmp) == "abc\n", "write_file/read_file");
   st_check(append_file(tmp, "d\n") && read_file(tmp) == "abc\nd\n", "append_file");
   st_check(file_size(tmp) == 6, "file_size");
+  st_eq(read_file_from(tmp, 4), "d\n", "read_file_from: what follows the offset");
+  st_eq(read_file_from(tmp, 0), "abc\nd\n", "read_file_from: offset 0 is the whole file");
+  st_eq(read_file_from(tmp, 100), "", "read_file_from: an offset past the end is empty");
+  st_eq(read_file_from(tmp + ".none", 3), "", "read_file_from: no file, nothing");
+  st_check(same_path("/a/b/c", "/a/b/c/") && !same_path("/a/b/c", "/a/b/d"), "same_path: a slash at the end does not count");
+  if (kHostMsys2) {
+    string np = native_path("/dev/shm/x");
+    st_check(!np.empty() && same_path("/dev/shm/x", np), "same_path: an MSYS2 path and its Windows form are one");
+    string win = np;
+    for (char& c : win) if (c == '/') c = '\\';
+    st_check(same_path("/dev/shm/x", win + "\\") && same_path(win, upper(win)), "same_path: backslashes, a slash at the end and case do not count");
+  }
   unlink(tmp.c_str());
   st_check(file_size(tmp) == -1, "file_size absent");
   CmdResult r = run_capture({"/bin/echo", "hi"});
@@ -348,6 +362,16 @@ static void st_kb() {
   } else {
     st_check(wu.size() == 2 && mu.size() == 2 && tu.size() == 1, "jira urls: a Linux box gets the URLs it always got");
   }
+  // a frameless assertion, ASSERT|<text> (what a plain assert() leaves in a Windows plugin), has no frames to search by: where the
+  // fixes are taken its text is the search. The URLs Linux gets for it, by "ASSERT|text", find nothing, and stay as they are
+  auto fu = kb_jira_urls("ASSERT|sp > last_savepoint()");
+  auto fn = kb_jira_urls("ASSERT|thd->free_list == 0");
+  if (kTakeFixes) {
+    st_check(fu.size() == 1 && fu[0].find("sp%20%3E%20last_savepoint()") != string::npos && fu[0].find("ASSERT") == string::npos, "jira urls: a frameless assertion is searched by its text");
+    st_check(kHostMsys2 ? fn.size() == 2 && fn[1].find("free_list%20%3D%3D%20__null") != string::npos : fn.size() == 1, "jira urls: and by its __null reading where a 0 may be one");
+  } else {
+    st_check(fu.size() == 2 && fn.size() == 2, "jira urls: a Linux box gets the URLs it always got for a frameless assertion");
+  }
   // no variant where a 0 is no pointer test, where __null is there already, or where the UID has no assertion text
   st_check(kb_jira_urls("scale >= 0|SIGABRT|f1|f2|f3|f4").size() == 2 && kb_jira_urls("x == 0x10|SIGABRT|f1|f2|f3|f4").size() == 2 &&
            kb_jira_urls("x % 2 == 10|SIGABRT|f1|f2|f3|f4").size() == 2 && kb_jira_urls("thd->free_list == __null|SIGABRT|f1|f2|f3|f4").size() == 2 &&
@@ -368,6 +392,9 @@ static void st_kb() {
                     "SIGSEGV|Item_equal_iterator<List_iterator_fast, Item>::get_curr_field|Item_equal::contains|Item_field::find_item_equal|eliminate_item_equal   ## MDEV-38879\n"
                     "n < m_size|SIGABRT|Bounds_checked_array<Item*>::operator[]|Item::split_sum_func2|Item_cond::split_sum_func|JOIN::prepare   ## MDEV-40560\n"
                     "SIGSEGV|std::__atomic_base<long>::store|Atomic_relaxed<long>::store|Atomic_relaxed<long>::operator=|trx_t::commit_tables   ## MDEV-30941\n"
+                    "cursor->pos_state == BTR_PCUR_IS_POSITIONED|SIGABRT|btr_pcur_get_rec|row_search_mvcc|ha_innobase::index_read|handler::index_read_map   ## MDEV-36773\n"
+                    "((thd && (WSREP_PROVIDER_EXISTS_ && thd->variables.wsrep_on)) && wsrep_emulate_bin_log) || mysql_bin_log.is_open()|SIGABRT|binlog_trans_log_savepos|THD::binlog_set_stmt_begin|a|b   ## MDEV-27296\n"
+                    "select_lex->select_number == (2147483647 *2U +1U) || !output|SIGABRT|JOIN::save_explain_data|JOIN::build_explain|JOIN::optimize|subselect_single_select_engine::exec   ## MDEV-36750\n"
                     "\n###### FIXED BUGS ######\n");
     g_paths.known_bugs = kbn;
     auto one = [](const KbMatch& m, const char* key) { return kb_verdict(m) == KbVerdict::Known && m.exact.size() == 1 && m.exact[0].find(key) != string::npos; };
@@ -383,6 +410,12 @@ static void st_kb() {
       {"SIGSEGV|Item_equal_iterator<List_iterator_fast,Item>::get_curr_field|Item_equal::contains|Item_field::find_item_equal|eliminate_item_equal", "MDEV-38879"},
       {"n < m_size|SIGABRT|Bounds_checked_array<Item *>::operator[]|Item::split_sum_func2|Item_cond::split_sum_func|JOIN::prepare", "MDEV-40560"},
       {"SIGSEGV|std::__atomic_base<__int64>::store|Atomic_relaxed<__int64>::store|Atomic_relaxed<__int64>::operator=|trx_t::commit_tables", "MDEV-30941"},
+      // a Windows frame with template arguments where the list has the frame bare
+      {"cursor->pos_state == BTR_PCUR_IS_POSITIONED|SIGABRT|btr_pcur_get_rec|row_search_mvcc<InnoDBPolicy<1,1> >|ha_innobase::index_read|handler::index_read_map", "MDEV-36773"},
+      // a build without WSREP: the macros are (0), and the list has them expanded
+      {"((0) && (0)) || mysql_bin_log.is_open()|SIGABRT|binlog_trans_log_savepos|THD::binlog_set_stmt_begin|a|b", "MDEV-27296"},
+      // UINT_MAX, as MSVC and as glibc write it
+      {"select_lex->select_number == 0xffffffff || !output|SIGABRT|JOIN::save_explain_data|JOIN::build_explain|JOIN::optimize|subselect_single_select_engine::exec", "MDEV-36750"},
     };
     for (auto& o : other) {
       KbMatch m = kb_search(o.uid);
@@ -395,7 +428,10 @@ static void st_kb() {
     for (const char* uid : {"thd->free_list != 0|SIGABRT|MYSQLparse|parse_sql|mysql_parse|dispatch_command", "thd->free_list == 10|SIGABRT|MYSQLparse|parse_sql|mysql_parse|dispatch_command",
                             "SIGSEGV|Bitmap<65>::set_bit|sort_and_filter_keyuse|make_join_statistics|JOIN::optimize_inner",
                             "error != DB_FOREIGN_DUPLICATE_KEY|SIGABRT|ha_innobase::delete_row|handler::ha_delete_row|TABLE::delete_row<1>|TABLE::delete_row",
-                            "SIGSEGV|std::__atomic_base<int>::store|Atomic_relaxed<int>::store|Atomic_relaxed<int>::operator=|trx_t::commit_tables"})
+                            "SIGSEGV|std::__atomic_base<int>::store|Atomic_relaxed<int>::store|Atomic_relaxed<int>::operator=|trx_t::commit_tables",
+                            "cursor->pos_state == BTR_PCUR_IS_POSITIONED|SIGABRT|btr_pcur_get_rec|other_frame<1>|ha_innobase::index_read|handler::index_read_map",
+                            "((0) && (1)) || mysql_bin_log.is_open()|SIGABRT|binlog_trans_log_savepos|THD::binlog_set_stmt_begin|a|b",
+                            "select_lex->select_number == 0xfffffffe || !output|SIGABRT|JOIN::save_explain_data|JOIN::build_explain|JOIN::optimize|subselect_single_select_engine::exec"})
       st_check(kb_search(uid).exact.empty(), string("kb_search: no match for ") + uid);
     string kerr;
     bool dup = !kb_add_to(kbn, "thd->free_list == 0|SIGABRT|MYSQLparse|parse_sql|mysql_parse|dispatch_command", "MDEV-1", &kerr);
@@ -403,6 +439,36 @@ static void st_kb() {
     st_check(kb_add_to(kbn, "thd->free_list == 0|SIGABRT|MYSQLparse|parse_sql|mysql_parse|other_frame", "MDEV-2", &kerr), "kb_add_to: another frame is not a duplicate");
     g_paths.known_bugs = save_kb;
     unlink(kbn.c_str());
+  }
+  // A frameless assertion, ASSERT|<text>, is what a plain assert() leaves in a Windows plugin. Where the fixes are taken it counts
+  // as the list's <text>|SIGABRT|frames entry when the lines that start so share one bug key; the text of several bugs is only
+  // a partial match, a text that merely starts another's is none, and a Linux box keeps its verdict (none of these is found).
+  {
+    string kba = fmt("/tmp/omnium_st_kbassert_%d", getpid()), save_kb = g_paths.known_bugs;
+    write_file(kba, "##### CURRENT BUGS (Search key: Mac) #####\n"
+                    "sp > last_savepoint()|SIGABRT|federatedx_io_mysql::savepoint_set|federatedx_txn::sp_acquire|federatedx_txn::txn_begin|ha_federatedx::external_lock   ## MDEV-29178\n"
+                    "sp > last_savepoint()|SIGABRT|federatedx_io_mysql::savepoint_set|federatedx_txn::sp_acquire|federatedx_txn::stmt_begin|ha_federatedx::external_lock   ## MDEV-29178\n"
+                    "length > 0|SIGABRT|a|b|c|d   ## MDEV-1\n"
+                    "length > 0|SIGABRT|e|f|g|h   ## MDEV-2\n"
+                    "x > 0 && y|SIGABRT|a|b|c|d   ## MDEV-3\n"
+                    "ASSERT|typed text   ## MDEV-5\n"
+                    "\n###### FIXED BUGS ######\n"
+                    "# old text|SIGABRT|a|b|c|d   ## Fixed ## MDEV-4\n");
+    g_paths.known_bugs = kba;
+    KbMatch one = kb_search("ASSERT|sp > last_savepoint()");
+    st_check(kTakeFixes ? kb_verdict(one) == KbVerdict::Known && one.exact.size() == 2 : kb_verdict(one) == KbVerdict::NotFound, "kb_search: a frameless assertion is the list's entry for that text");
+    st_check(kTakeFixes == (kb_verdict(kb_search("ASSERT|SP > LAST_SAVEPOINT()")) == KbVerdict::Known), "kb_search: and the text is read without regard to case, as grep -Fi does");
+    KbMatch many = kb_search("ASSERT|length > 0");
+    st_check(kTakeFixes ? kb_verdict(many) == KbVerdict::Partial && many.partial.size() == 2 && kb_verdict_text("ASSERT|length > 0", many).find("ASSERTION TEXT") != string::npos
+                        : kb_verdict(many) == KbVerdict::NotFound, "kb_search: the text of two bugs is only a partial match");
+    st_check(kb_verdict(kb_search("ASSERT|x > 0")) == KbVerdict::NotFound, "kb_search: a text that only starts another's is no match, with or without the |SIGABRT|");
+    st_check(kTakeFixes ? kb_verdict(kb_search("ASSERT|old text")) == KbVerdict::FixedOnly : kb_verdict(kb_search("ASSERT|old text")) == KbVerdict::NotFound,
+             "kb_search: an entry that is only in the list as fixed reads as fixed-only");
+    st_check(kb_verdict(kb_search("ASSERT|typed text")) == KbVerdict::Known, "kb_search: a typed ASSERT| line of the list is found as it always was");
+    st_check(kb_verdict(kb_search("ASSERT|nothing like it")) == KbVerdict::NotFound && kb_verdict(kb_search("sp > last_savepoint()|SIGABRT|other_a|other_b|other_c|other_d")) != KbVerdict::Known,
+             "kb_search: no match for an assertion nobody listed, nor for the text with other frames");
+    g_paths.known_bugs = save_kb;
+    unlink(kba.c_str());
   }
   string tmp = fmt("/tmp/omnium_st_kb_%d", getpid());
   write_file(tmp, "## header\n\n##### Filter dud #####\nSIGSEGV|old|a|b|c                ## SPECIAL-1\n\n"
@@ -987,16 +1053,63 @@ static void st_deep_clean(const string& wd) {
   remove_tree(g_cfg.shm_dir + "/" + basename_of(wd));
 }
 
-static void st_deep() {
+// the build the live checks use: the fastest kind, a plain optimised CS build
+static bool st_deep_build(Basedir& b, const string& what) {
   vector<Basedir> all = basedirs_scan(g_cfg.test_dir);
   const Basedir* pick = nullptr;
-  for (auto& b : all) {
-    if (b.flavour != Flavour::Plain || b.dbg || b.bin.empty() || b.es) continue;   // the fastest kind: a plain optimised CS build
-    if (!pick || version_cmp(b.version, pick->version) > 0) pick = &b;
+  for (auto& x : all) {
+    if (x.flavour != Flavour::Plain || x.dbg || x.bin.empty() || x.es) continue;   // the fastest kind: a plain optimised CS build
+    if (!pick || version_cmp(x.version, pick->version) > 0) pick = &x;
   }
-  if (!pick) { st_skip("deep: the live checks, as there is no plain optimised build under " + g_cfg.test_dir); return; }
+  if (!pick) { st_skip(what + ": the live checks, as there is no plain optimised build under " + g_cfg.test_dir); return false; }
+  st_check(basedir_probe(pick->path, b), what + ": the build probes clean");
+  return true;
+}
+// A second server on the port of the first: it dies at the bind, and its start says so instead of finding the first server there and
+// calling itself up (a trial then ran its SQL on the first one and was saved as a crash of the second, which had none). Only a server
+// that is found by its port can be mistaken for another, so a socket build has nothing to check.
+static void st_deep_port_clash(const Basedir& b, Instance& ci, const string& ctpl, const string& cdir) {
+  if (!ci.tcp) return;
+  string sdir = cdir + "/second";
+  mkdirs(sdir);
+  Instance si;
+  si.bd = &b;
+  si.set_paths(sdir);
+  si.port = ci.port;
+  double t0 = now_ms();
+  bool up = si.start_fresh(ctpl, 120);
+  st_check(!up, "deep: a server whose port another server holds does not count as started");
+  st_check(port_clash_in_log(read_file(si.errlog)), "deep: its log says the port was taken [" + si.start_note + "]");
+  st_check(now_ms() - t0 < 60000, "deep: and the start ends when the server does, not at its timeout");
+  si.kill_hard();
+  st_check(ci.alive(), "deep: the first server goes on");
+  MYSQL* am = mysql_init(nullptr);
+  bool conn = endpoint_connect(am, ci.endpoint(), "root", nullptr, 0);
+  st_check(conn, "deep: and it still answers");
+  mysql_close(am);
+}
+// --selftest --deep-ports: that check alone, on a real server. The whole deep suite takes an hour, and its "fresh" step wipes the
+// fresh server of the build (a directory shared with whoever runs `omnium fresh`); this one touches nothing outside its own temp dir.
+static void st_deep_ports() {
   Basedir b;
-  st_check(basedir_probe(pick->path, b), "deep: the build probes clean");
+  if (!st_deep_build(b, "deep-ports")) return;
+  if (!endpoint_tcp(b)) { st_skip("deep-ports: the build is a socket one (a Windows build, or OMNIUM_TCP=1, is found by its port), so nothing can answer for another"); return; }
+  string cdir = st_tmp() + "/ports";
+  mkdirs(cdir);
+  Instance ci;
+  ci.bd = &b;
+  ci.set_paths(cdir);
+  string ctpl = template_for(b, "", cdir + "/templates");
+  bool up = !ctpl.empty() && ci.start_fresh(ctpl, 120);
+  st_check(up, "deep-ports: the first server starts [" + ci.start_note + "]");
+  if (up) st_deep_port_clash(b, ci, ctpl, cdir);
+  ci.kill_hard();
+}
+
+static void st_deep() {
+  Basedir b;
+  if (!st_deep_build(b, "deep")) return;
+  vector<Basedir> all = basedirs_scan(g_cfg.test_dir);        // the later checks pick other builds from it
   string tmp = st_tmp();
   string sql = tmp + "/deep.sql";
   {
@@ -1262,6 +1375,7 @@ static void st_deep() {
         client_run(np, odir + "/rows.sql", nstop, nr, &nerr);
         st_check(nr.performed == 0, "deep: a log directory it cannot write to stops the thread");
       }
+      st_deep_port_clash(b, ci, ctpl, cdir);
       ci.kill_hard();
     }
     // the client when the server goes away mid-run: the threads see the connection drop and write
@@ -2209,6 +2323,13 @@ static void st_portability() {
     st_check(sd.silent_death() && sd.silent_death_uid() == "CRASH_NO_LOG|exit status 127", "silent_death: a server that ended on its own with status 127 [" + sd.silent_death_uid() + "]");
     sd.exit_status = 11;                                         // killed by a signal
     st_check(sd.silent_death() && sd.silent_death_uid() == "CRASH_NO_LOG|exit status 139", "and one that a signal ended");
+    // with the native process's own status the UID says what killed it, as Cygwin's 139 and 127 do not
+    sd.win_status = 0xC00000FD;
+    sd.win_status_known = true;
+    st_check(sd.silent_death_uid() == "CRASH_NO_LOG|exit code 0xC00000FD" && sd.silent_death_note() == " (a stack overflow)", "silent_death: the NTSTATUS of a stack overflow [" + sd.silent_death_uid() + "]");
+    sd.win_status = 0xC0000409;
+    st_check(sd.silent_death_uid() == "CRASH_NO_LOG|exit code 0xC0000409" && icontains(sd.silent_death_note(), "stack cookie"), "and the one of a failed stack cookie check");
+    sd.win_status_known = false;
     sd.exit_status = 0;
     st_check(!sd.silent_death(), "silent_death: a clean exit is no crash");
     sd.exit_status = 127 << 8;
@@ -2252,6 +2373,60 @@ static void st_portability() {
       st_check(moved && dir_exists(tmp + "/mv_moved") && !dir_exists(d), "move_tree: a folder with a file another process holds is moved once the file is let go [" + mvwhy + "]");
       st_check(took > 1.0, fmt("and it waited for that (%.1f s)", took));
       if (hp > 0) wait_pid(hp, 20000);
+      // a lock that outlasts the retries (a crashed server held by Windows Error Reporting, for half a minute): the
+      // folder is copied, which works, and what cannot be removed yet is left
+      string d2 = tmp + "/mv_held2", marker2 = tmp + "/mv_marker2.txt";
+      mkdirs(d2);
+      write_file(d2 + "/held.dmp", "MDMP2");
+      string script2 = "$fs = [System.IO.File]::Open('" + native_path(d2 + "/held.dmp") + "', 'Open', 'ReadWrite', 'Read'); Set-Content '" + native_path(marker2) +
+                       "' 'locked'; Start-Sleep -Seconds 16; $fs.Close()";
+      pid_t hp2 = spawn_program({"/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", "-NoProfile", "-Command", script2}, tmp + "/mv_ps2.log", "", true);
+      for (int i = 0; i < 200 && hp2 > 0 && !file_exists(marker2); i++) usleep(100000);
+      string mvwhy2;
+      bool moved2 = file_exists(marker2) && move_tree(d2, tmp + "/mv_copied", &mvwhy2);
+      st_check(moved2 && read_file(tmp + "/mv_copied/held.dmp") == "MDMP2", "move_tree: a lock that outlasts the retries is got round by a copy [" + mvwhy2 + "]");
+      if (hp2 > 0) wait_pid(hp2, 30000);
+      remove_tree(d2);
+    }
+    // a frameless silent-death UID is shared by every cause, so the per-UID cap keys it by what the server was asked last
+    {
+      string sd = tmp + "/sdstmt";
+      mkdirs(sd);
+      auto key_of = [&](const string& sql) { write_file(sd + "/default.node.tld_thread-0.last.sql", sql); return silent_death_statement(sd); };
+      st_eq(key_of("CALL sp1;\n(((SELECT SQL_BUFFER_RESULT * FROM t4 WHERE 1) FOR UPDATE))\n"), "SELECT SQL_BUFFER_RESULT", "silent_death_statement: the last statement, past its opening brackets");
+      st_eq(key_of("INSERT INTO t VALUES (1);\nDROP TABLE `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`.`b`;\n"), "DROP TABLE", "and a DROP TABLE of any name is one cause");
+      st_eq(key_of("with recursive x as (select 1) select * from x;\n"), "WITH RECURSIVE", "and any case");
+      st_eq(key_of("INSERT HIGH_PRIORITY INTO t1 VALUES (1) ON DUPLICATE KEY UPDATE a = 2;"), "INSERT HIGH_PRIORITY", "and the second word of an INSERT with a modifier");
+      st_eq(silent_death_statement(tmp + "/no_such_trial"), "", "and nothing for a trial with no last statement");
+    }
+    // a HOME that is the Windows profile, with no settings file, while the MSYS2 home has one, is a mistake of the environment
+    {
+      st_eq(msys2_home_fix("/c/Users/R", "/c/Users/R", "/home/R", false, true), "/home/R", "msys2_home_fix: the profile as HOME with no settings file, the MSYS2 home has one: the MSYS2 home");
+      st_eq(msys2_home_fix("/c/Users/R", "/c/Users/R", "/home/R", true, true), "", "msys2_home_fix: not when the profile has a settings file of its own");
+      st_eq(msys2_home_fix("/c/Users/R", "/c/Users/R", "/home/R", false, false), "", "msys2_home_fix: not when the MSYS2 home has none either");
+      st_eq(msys2_home_fix("/home/R", "/c/Users/R", "/home/R", false, true), "", "msys2_home_fix: not for the MSYS2 home itself");
+      st_eq(msys2_home_fix("/tmp/omnium_st_home", "/c/Users/R", "/home/R", false, true), "", "msys2_home_fix: not for any other HOME, a check's own for one");
+    }
+    // the CPU time of a process: readable, and a busy loop moves it
+    {
+      long c0 = proc_cpu_ms(getpid());
+      double until = now_ms() + 300;
+      volatile unsigned long spin = 0;
+      while (now_ms() < until) spin = spin + 1;
+      long c1 = proc_cpu_ms(getpid());
+      st_check(c0 >= 0 && c1 > c0 && proc_cpu_ms(-1) == -1, fmt("proc_cpu_ms: the CPU time of a process, which a busy loop moves (%ld, %ld ms)", c0, c1));
+    }
+    // the native process behind a Cygwin pid: a handle to it while it runs, and its exit status after it ended
+    if (kHostMsys2 && file_exists("/c/Windows/System32/ping.exe")) {
+      pid_t pp = spawn_program({"/c/Windows/System32/ping.exe", "-n", "3", "127.0.0.1"}, tmp + "/ping.log", "", true);
+      uintptr_t wh = 0;
+      for (int i = 0; i < 50 && pp > 0 && !wh; i++) { wh = winproc_open(pp, "ping"); if (!wh) usleep(100000); }
+      uint32_t wcode = 99;
+      st_check(wh != 0 && !winproc_exit_status(wh, &wcode), "winproc: a handle to the native process, which runs");
+      st_check(winproc_open(pp, "no_such_image") == 0, "winproc: and none when the image is not the one asked for");
+      if (pp > 0) wait_pid(pp, 20000);
+      st_check(wh != 0 && winproc_exit_status(wh, &wcode) && wcode == 0, "winproc: its exit status after it ended");
+      winproc_close(wh);
     }
     // a Windows path given as an argument is absolute there, not a name under the working directory
     if (kHostMsys2) {
@@ -2292,6 +2467,13 @@ static void st_portability() {
     st_check(log_aborted("2026-09-07  8:00:00 0 [ERROR] Aborting\n"), "log_aborted: the MariaDB line");
     st_check(log_aborted("2026-09-23T21:25:19.657260Z 0 [ERROR] [MY-010119] [Server] Aborting\n"), "log_aborted: the MySQL 8.0 line");
     st_check(!log_aborted("2026-09-07  8:00:00 0 [Note] mariadbd: ready for connections.\n"), "log_aborted: not on a clean start");
+    st_check(port_clash_in_log("2026-10-05 21:09:11 0 [ERROR] Can't start server: Bind on TCP/IP port. Got error: 10048: Only one usage of each socket address (protocol/network address/port) is normally permitted.\n"),
+             "port_clash_in_log: the Windows bind failure");
+    st_check(port_clash_in_log("2026-09-07  8:00:00 0 [ERROR] Can't start server: Bind on TCP/IP port: Address already in use\n"), "port_clash_in_log: the Linux bind failure");
+    st_check(!port_clash_in_log("2026-09-07  8:00:00 0 [ERROR] Aborting\n2026-10-05 21:09:11 0 [Note] Server socket created on IP: '::', port: '13555'.\n"),
+             "port_clash_in_log: not on an Aborting alone, nor on the note of the socket");
+    st_check(server_log_ready("2026-10-05 21:09:09 0 [Note] mariadbd.exe: ready for connections.\n") && !server_log_ready("2026-09-07  8:00:00 0 [ERROR] Aborting\n"),
+             "server_log_ready: the line says it, and a log without it does not");
   }
   // the client module MySQL 8.0+ needs comes from a plain MariaDB build
   {
@@ -2368,6 +2550,14 @@ static void st_portability() {
     for (int rows : {24, 30, 40, 60, 100})
       st_check(tui_frame_lines(rows, 120, 2, 3, 0, 0, 8) == rows - 1,
                fmt("tui: the log fills what the lists leave of a %d-row terminal", rows));
+    // a window taller than the screen: the rows under the taskbar are left empty (50 rows of 20 px)
+    st_check(rows_below_work_area(100, 1000, 900, 50) == 10, "tui: the rows of a window that lie below the work area");
+    st_check(rows_below_work_area(100, 1000, 905, 50) == 10, "tui: a row cut in half counts as hidden");
+    st_check(rows_below_work_area(100, 1000, 1100, 50) == 0, "tui: a window that ends at the work area hides nothing");
+    st_check(rows_below_work_area(100, 1000, 1500, 50) == 0, "tui: a window inside the work area hides nothing");
+    st_check(rows_below_work_area(2000, 1000, 900, 50) == 50, "tui: a window off the bottom of the screen hides all its rows");
+    st_check(rows_below_work_area(100, 0, 900, 50) == 0 && rows_below_work_area(100, 1000, 900, 0) == 0,
+             "tui: a window of no size hides nothing");
   }
   // a settings file from before a key was added, under a home of its own
   {
@@ -2568,6 +2758,7 @@ int cmd_selftest(const Args& a) {
   st_windows();
   st_portability();
   for (auto& x : a) if (x == "--deep") { st_detect_parity(); st_deep(); }
+  for (auto& x : a) if (x == "--deep-ports") st_deep_ports();
   long p = g_st_pass.load(), f = g_st_fail.load();
   printf("selftest: %ld checks, %ld failed (%.1f s)\n", p + f, f, (now_ms() - t0) / 1000.0);
   for (auto& w : g_st_failed) printf("  failed: %s\n", w.c_str());
@@ -2872,6 +3063,26 @@ const UidFixture UID_FIXTURES[] = {
       "server.dll!buf_page_t::in_file()[buf0buf.h:710]\n"
       "ntdll.dll!RtlUserThreadStart()\n",
    "SIGSEGV|std::__atomic_base<unsigned int>::load|Atomic_relaxed<unsigned int>::operator unsigned int|(anonymous namespace)::helper|buf_page_t::state", true},
+  // the thread entry of the pthread emulation, pthread_start, is glibc's start_thread: the list's line for a crash in a RocksDB
+  // thread ends in start_thread|clone, and this UID, which stops at start_thread, is a prefix of it
+  {"win_thread_start",
+      "260912 10:00:07 [ERROR] C:\\test\\MD120926-mariadb-13.1.1-windows-x86_64-dbg\\bin\\mariadbd.exe got exception 0xc0000005 ;\n"
+      "Attempting backtrace. Include this in the bug report.\n\n"
+      "ha_rocksdb.dll!myrocks::Rdb_drop_index_thread::run()[rdb_threads.cc:120]\n"
+      "ha_rocksdb.dll!myrocks::Rdb_thread::thread_func()[rdb_threads.cc:30]\n"
+      "server.dll!pthread_start()[my_winthread.c:60]\n"
+      "ucrtbase.dll!thread_start<unsigned int (__cdecl*)(void *),1>()\n"
+      "KERNEL32.DLL!BaseThreadInitThunk()\n"
+      "ntdll.dll!RtlUserThreadStart()\n",
+   "SIGSEGV|myrocks::Rdb_drop_index_thread::run|myrocks::Rdb_thread::thread_func|start_thread", true},
+  // a crashed temporary table by its Windows path, relative to the server's directory or in full, is the list's
+  // Table sql-temptable-X, as the Linux path /dev/shm/.../tmp/#sql-temptable-... is
+  {"win_temptable_crashed",
+      "2026-10-05 20:30:00 5 [ERROR] mariadbd.exe: Table '26-mariadb-13.1.1-windows-x86_64-dbg\\tmp\\#sql-temptable-a758-4-0' is marked as crashed and should be repaired\n",
+   "MARKED_AS_CRASHED|Table sql-temptable-X is marked as crashed and should be repaired", true},
+  {"win_temptable_crashed_full",
+      "2026-10-05 20:30:00 5 [ERROR] mariadbd.exe: Table 'C:\\msys64\\dev\\shm\\Omatrix1\\26-mariadb\\tmp\\#sql-temptable-a758-4-0' is marked as crashed and should be repaired\n",
+   "MARKED_AS_CRASHED|Table sql-temptable-X is marked as crashed and should be repaired", true},
 };
 string fixture_dir(const string& root, const UidFixture& f) {
   string d = root + "/" + f.name;
@@ -3213,6 +3424,127 @@ static void st_start_refused() {
   }
   remove_tree(tmp);
 }
+// a socket that listens on 127.0.0.1:<port> and counts what connects to it
+struct StCounter {
+  int fd = -1;
+  std::atomic<int> seen{0};
+  std::atomic<bool> stop{false};
+  std::thread th;
+  bool open(int port) {
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    struct sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = htons((uint16_t)port);
+    if (bind(fd, (struct sockaddr*)&a, sizeof(a)) != 0 || listen(fd, 16) != 0) { close(fd); fd = -1; return false; }
+    th = std::thread([this] {
+      while (!stop) {
+        struct pollfd pf{fd, POLLIN, 0};
+        if (poll(&pf, 1, 100) > 0 && (pf.revents & POLLIN)) {
+          int c = accept(fd, nullptr, nullptr);
+          if (c >= 0) { seen++; close(c); }
+        }
+      }
+    });
+    return true;
+  }
+  ~StCounter() { stop = true; if (th.joinable()) th.join(); if (fd >= 0) close(fd); }
+};
+// A TCP server counts as up when its own log, from where its start began, says it listens: another server may answer on its port, and a
+// start that lost the port dies at the bind. (A trial once ran its SQL on the server that held the port, and was saved as a crash of the one
+// that never had it.) The stand-in servers are scripts that write what a server writes; a listener on the port counts what connects, and a
+// start whose log has not said it listens must not have connected.
+static void st_start_tcp_gate() {
+  string tmp = st_tmp() + "/tcpgate";
+  struct Case { const char* name; const char* body; bool old_line; int timeout; bool probed; };
+  const Case cases[] = {
+    {"a server that has not said it listens", "echo \"2026-10-05 21:00:00 0 [Note] Plugin 'FEEDBACK' is disabled.\"\nexec sleep 8\n", false, 3, false},
+    {"a server that says it listens", "echo \"2026-10-05 21:00:00 0 [Note] mariadbd: ready for connections.\"\nexec sleep 8\n", false, 3, true},
+    {"a restart on a log that has the first start's line", "echo \"2026-10-05 21:00:00 0 [Note] InnoDB: Starting crash recovery.\"\nexec sleep 8\n", true, 3, false},
+    {"a server that lost its port",
+     "echo \"2026-10-05 21:00:00 0 [ERROR] Can't start server: Bind on TCP/IP port. Got error: 10048: Only one usage of each socket address (protocol/network address/port) is normally permitted.\"\n"
+     "echo \"2026-10-05 21:00:00 0 [ERROR] Aborting\"\nexit 1\n", false, 30, false},
+  };
+  for (auto& c : cases) {
+    remove_tree(tmp);
+    mkdirs(tmp + "/bin");
+    write_file(tmp + "/bin/mariadbd", string("#!/bin/sh\n") + c.body);
+    chmod((tmp + "/bin/mariadbd").c_str(), 0755);
+    Basedir fb;
+    fb.path = tmp;
+    fb.name = "tcpgate";
+    fb.bin = tmp + "/bin/mariadbd";
+    fb.vendor = Vendor::MariaDB;
+    fb.version = "13.1.0";
+    Instance in;
+    in.bd = &fb;
+    in.set_paths(tmp + "/trial");
+    in.tcp = true;
+    in.port = port_pick();
+    StCounter lc;
+    if (in.port == 0 || !lc.open(in.port)) { st_skip(string("the TCP start gate: no port to listen on for ") + c.name); continue; }
+    mkdirs(in.datadir);
+    mkdirs(in.logdir);
+    if (c.old_line) write_file(in.errlog, "2026-10-05 20:59:00 0 [Note] mariadbd: ready for connections.\n");
+    double t0 = now_ms();
+    bool ok = in.start_only(c.timeout);
+    double secs = (now_ms() - t0) / 1000.0;
+    in.kill_hard();
+    string what = string(c.name) + " [" + in.start_note + "]";
+    st_check(!ok, "TCP start: " + what + " does not come up");
+    st_check(c.probed ? lc.seen > 0 : lc.seen == 0, string("TCP start: ") + (c.probed ? "the port is tried once the log says it listens: " : "the port is not tried before the log says it listens: ") + what + fmt(" (%d connections)", lc.seen.load()));
+    if (string(c.name) == "a server that lost its port") {
+      st_check(port_clash_in_log(read_file(in.errlog)), "TCP start: the log of a server that lost its port says so");
+      st_check(secs < 20, "TCP start: and the start ends with the server, not at its timeout");
+    } else if (!c.probed) {
+      st_check(in.start_note == fmt("not ready within %d s", c.timeout), "TCP start: and the note says it never said it listens [" + in.start_note + "]");
+    }
+  }
+  remove_tree(tmp);
+}
+// The ports a server is given: below those Windows gives its clients, and free by the bind the server makes itself (a bind on 127.0.0.1 is told
+// "free" for a port that a server listens on, and for the source port of an open connection)
+static void st_ports() {
+  int lo = 65535, hi = 0;
+  for (int i = 0; i < 100; i++) {
+    int p = port_pick();
+    if (p > 0) { lo = std::min(lo, p); hi = std::max(hi, p); }
+  }
+  st_check(lo >= 13001 && hi <= (kHostMsys2 ? 49151 : 65000), fmt("port_pick stays in its range (%d to %d)", lo, hi));
+  if (!kHostMsys2) { st_skip("port_free: the server's own bind is what MSYS2 picks by; Linux keeps its probe on 127.0.0.1"); return; }
+  int port = port_pick();
+  int ls = socket(AF_INET6, SOCK_STREAM, 0);
+  int off = 0;
+  if (ls >= 0) setsockopt(ls, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+  struct sockaddr_in6 a6{};
+  a6.sin6_family = AF_INET6;
+  a6.sin6_addr = in6addr_any;
+  a6.sin6_port = htons((uint16_t)port);
+  bool listening = ls >= 0 && bind(ls, (struct sockaddr*)&a6, sizeof(a6)) == 0 && listen(ls, 4) == 0;
+  st_check(listening, "port_free: a socket holds a port the way a server does");
+  if (listening) {
+    st_check(!port_free(port), "port_free: a port that a server listens on is not free");
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a4{};
+    a4.sin_family = AF_INET;
+    a4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a4.sin_port = htons((uint16_t)port);
+    if (c >= 0 && connect(c, (struct sockaddr*)&a4, sizeof(a4)) == 0) {
+      struct sockaddr_in l{};
+      socklen_t n = sizeof(l);
+      getsockname(c, (struct sockaddr*)&l, &n);
+      st_check(!port_free(ntohs(l.sin_port)), "port_free: nor is the source port of an open connection");
+    } else {
+      st_check(false, "port_free: a client connects to the port");
+    }
+    if (c >= 0) close(c);
+  }
+  if (ls >= 0) close(ls);
+  bool again = false;
+  for (int i = 0; i < 30 && !again; i++) { again = port_free(port); if (!again) usleep(100000); }
+  st_check(again, "port_free: the port is free again once the server is gone");
+}
 
 // the plumbing: the workdir and its files, the small helpers, the process helpers, the mail text.
 // Everything here works on a temporary /data and /dev/shm, so a real run is never touched.
@@ -3362,8 +3694,13 @@ static void st_plumbing() {
     int pct = dir_used_pct("/dev/shm");
     st_check(pct >= 0 && pct <= 100 && dir_used_pct(tmp + "/no_such_dir") == 0, "dir_used_pct gives a percentage, and 0 for a path that is not there");
     st_check(ram_total_bytes() > 0 && ram_available_bytes() > 0, "the RAM helpers read /proc/meminfo");
-    double la = load_average(), pl = atof(read_file("/proc/loadavg").c_str());
-    st_check((la > pl ? la - pl : pl - la) < 0.5 + pl / 10, "load_average reads the one-minute load");
+    bool load_ok = false;                                        // two reads of a figure that moves: on a busy box one of a few pairs agrees
+    for (int i = 0; i < 6 && !load_ok; i++) {
+      double la = load_average(), pl = atof(read_file("/proc/loadavg").c_str());
+      load_ok = (la > pl ? la - pl : pl - la) < 0.5 + pl / 10;
+      if (!load_ok) usleep(300000);
+    }
+    st_check(load_ok, "load_average reads the one-minute load");
     st_check(!stamp_of(now_s()).empty(), "stamp_of prints a time");
     CmdResult sh = run_shell("echo hello", 10, tmp);
     st_check(sh.rc == 0 && trim(sh.out) == "hello", "run_shell runs a command line");
@@ -3385,6 +3722,8 @@ static void st_plumbing() {
     }
     st_run_capture_in_large();
     st_start_refused();
+    st_start_tcp_gate();
+    st_ports();
     log_open(tmp + "/log.txt");
     logline("a line %d", 1);
     logwarn("a warning %s", "here");
@@ -3421,7 +3760,9 @@ static void st_plumbing() {
     // a role child with the event pipe: hold sleeps until it is killed
     Child hc;
     st_check(spawn_role(hc, "hold", {tmp}, tmp + "/hold.log"), "spawn_role starts a hold child");
-    st_check(pid_alive(hc.pid), "the hold child is alive");
+    bool hold_up = false;                                        // a loaded box can take a moment to show the new process
+    for (int i = 0; i < 50 && !hold_up; i++) { hold_up = pid_alive(hc.pid); if (!hold_up) usleep(100000); }
+    st_check(hold_up, "the hold child is alive");
     string line;
     st_check(!child_read(hc, line, 200), "the hold child sends no events");
     st_check(child_send(hc, "stop"), "a command goes down to the child");
@@ -5390,6 +5731,48 @@ static void st_corners() {
     st_check(t.find("MS ") != string::npos && t.find("ES ") < t.find("MS "), "MySQL comes after the MariaDB rows");
     MatrixResult empty;
     st_check(!matrix_format(empty).empty(), "an empty matrix still says so");
+    // which testcase a report carries: the prettified one while the trial's own build shows the bug on it, else the reduced one when that does
+    {
+      auto row_of = [](const char* name, const char* uid) {
+        MatrixRow r;
+        basedir_parse_name(name, r.b);
+        r.b.name = name;
+        r.b.path = string("/test/") + name;
+        r.uid = uid;
+        return r;
+      };
+      const char* own = "MD180826-mariadb-13.1.0-linux-x86_64-dbg";
+      const char* other = "MD180826-mariadb-12.3.2-linux-x86_64-opt";
+      const string own_path = string("/test/") + own;
+      auto matrix_of = [&](const char* own_uid, const char* other_uid) {
+        MatrixResult x;
+        x.rows.push_back(row_of(own, own_uid));
+        x.rows.push_back(row_of(other, other_uid));
+        return x;
+      };
+      st_check(!matrix_row_shows_bug(row_of(own, "No bug found")) && !matrix_row_shows_bug(row_of(own, "No result (server did not start)")) &&
+                   matrix_row_shows_bug(row_of(own, "SIGSEGV|a|b|c|d")),
+               "matrix_row_shows_bug: a UID is a bug, and no bug and no result are not");
+      int calls = 0;
+      MatrixResult shown = matrix_of("SIGSEGV|x|y|z|w", "No bug found");
+      st_check(!report_prefer_reduced(shown, own_path, [&](MatrixResult&) { calls++; return true; }) && calls == 0,
+               "a testcase that still shows the bug on the trial's build is kept, and the reduced one is not replayed");
+      MatrixResult lost = matrix_of("No bug found", "No bug found");
+      bool took = report_prefer_reduced(lost, own_path, [&](MatrixResult& out) { out = matrix_of("SIGSEGV|x|y|z|w", "SIGSEGV|x|y|z|w"); return true; });
+      st_check(took && matrix_row_shows_bug(lost.rows[0]) && matrix_row_shows_bug(lost.rows[1]),
+               "a testcase that lost the bug on the trial's build gives way to the reduced one, and its matrix is the report's");
+      MatrixResult elsewhere = matrix_of("No bug found", "SIGSEGV|other|build|only|1");
+      took = report_prefer_reduced(elsewhere, own_path, [&](MatrixResult& out) { out = matrix_of("No bug found", "No bug found"); return true; });
+      st_check(!took && elsewhere.rows[1].uid == "SIGSEGV|other|build|only|1",
+               "when the reduced one shows nothing on the trial's build either, the matrix stays the prettified one's (another build's bug does not count)");
+      MatrixResult failed_run = matrix_of("No bug found", "No bug found");
+      took = report_prefer_reduced(failed_run, own_path, [&](MatrixResult&) { return false; });
+      st_check(!took && !matrix_row_shows_bug(failed_run.rows[0]), "a replay of the reduced testcase that cannot run changes nothing");
+      MatrixResult anywhere = matrix_of("No bug found", "SIGSEGV|other|build|only|1");
+      calls = 0;
+      st_check(!report_prefer_reduced(anywhere, "", [&](MatrixResult&) { calls++; return true; }) && calls == 0,
+               "with no build of the trial known, a bug on any build keeps the testcase");
+    }
     // the build list: names given, a name that is not there, and the report set from the registry
     vector<Basedir> set;
     string merr;

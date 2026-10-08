@@ -67,6 +67,7 @@ long to_long(std::string_view s, long dflt = 0);
 double to_double(std::string_view s, double dflt = 0);
 string fmt(const char* f, ...) __attribute__((format(printf, 1, 2)));
 string read_file(const string& path);                         // "" when unreadable
+string read_file_from(const string& path, int64_t from);      // what follows the first `from` bytes, "" when unreadable: a log read from where a start began
 bool write_file(const string& path, std::string_view content); // atomic: tmp + rename
 bool append_file(const string& path, std::string_view content);
 bool file_exists(const string& path);
@@ -108,9 +109,17 @@ string native_path(const string& posix);
 // --opt=/path of an argument itself when it starts a native program, but not --opt=FILE:/path, which then
 // reaches the server as /dev/shm/... and is looked for on the wrong drive. A value without a path is kept.
 string native_option(const string& opt);
+// Whether two paths name one folder, the way a Windows server reports its datadir (C:\msys64\dev\shm\x\) and an MSYS2 path
+// names it (/dev/shm/x): slashes and case do not count, nor a slash at the end. Off MSYS2 only the spelling is compared.
+bool same_path(const string& a, const string& b);
 // the person's own home: $HOME, and on Windows the profile, as the MSYS2 home is a folder of the
 // shared MSYS2 install (a HOME that was set to something else is kept)
 string user_home();
+// Which HOME omnium runs with, MSYS2: started from a Windows shell that hands HOME over as the profile (/c/Users/Roel), omnium would
+// write a settings file and shell files there beside the real ones of the MSYS2 home, and fall over on the defaults. A HOME that is
+// the profile, has no settings file, while the MSYS2 home has one is a mistake of the environment: "" keeps HOME, else the MSYS2 home.
+string msys2_home_fix(const string& home, const string& profile, const string& msys_home, bool home_has_conf, bool msys_has_conf);
+void fix_msys2_home();                                        // sets HOME to the MSYS2 home in that case and says so; does nothing elsewhere
 // the Jira token file when PAT_FILE names none: <home>/.omnium_jira_pat, or the file ~/jira reads
 // when only that one exists
 string default_pat_file(const string& home);
@@ -315,6 +324,7 @@ bool pid_alive(pid_t pid);
 int wait_pid(pid_t pid, int timeout_ms);                      // exit status or -1 (still running)
 string proc_cmdline(pid_t pid);
 uint64_t proc_rss_bytes(pid_t pid);
+long proc_cpu_ms(pid_t pid);                                   // user plus system CPU time the process has used, in ms; -1 when it cannot be read
 vector<pid_t> proc_children(pid_t pid);
 // role side
 void role_init();                                             // takes fd 3/4, no-op outside a role
@@ -404,6 +414,10 @@ string basedir_source_rev(const Basedir& b, bool files_only = false);  // files_
 vector<string> san_env_for(const Basedir& b);                  // ASAN_OPTIONS=... lines from omnium.san.opt
 string vendor_options(const Basedir& b);                         // what a MySQL or Percona server needs on top
 bool log_aborted(const string& log);                             // the server gave up at startup
+bool server_log_ready(const string& log);                        // "ready for connections": the server listens (a bind that failed never prints it)
+// the server could not bind its port because something holds it: "Address already in use" on Linux, error 10048 "Only one
+// usage of each socket address" on Windows. The trial is dropped, as nothing ran on a server that never had its port.
+bool port_clash_in_log(const string& log);
 string mysafe_options(const Basedir& b);                       // the MYSAFE block, flavour adjusted
 int version_cmp(const string& a, const string& b);             // 10.11.19 vs 11.4.13
 bool version_at_least(const string& v, const string& floor);
@@ -414,7 +428,10 @@ string myinit_from(const string& options);                     // the options th
 // the install-db command line: the Linux script's options, or the Windows tool's own set
 vector<string> install_db_argv(const Basedir& b, const string& datadir, const string& tmpdir, const string& myinit);
 
-int port_pick();                                               // a free TCP port in [13001, 65000]
+int port_pick();                                               // a free TCP port in [13001, 65000]; MSYS2: [13001, 49151], below the ports Windows gives its clients
+// MSYS2: whether the server's own bind on the port would work. mysqld binds the wildcard address and sets no SO_REUSEADDR, which is the bind
+// that a listening server and an open connection's source port both refuse; a bind on 127.0.0.1 is told "free" by both.
+bool port_free(int port);
 
 // how a client reaches a server: the unix socket, or TCP on 127.0.0.1 where there is none (a
 // Windows server, or OMNIUM_TCP=1 to run the same path on Linux)
@@ -432,10 +449,14 @@ struct Instance {
   bool start_failed = false;
   bool detached = false;    // the server outlives omnium (omnium fresh); a trial server never does
   string start_note;
+  int64_t log_from = 0;     // the size of the error log when this start began: a restart on the same log has the first start's lines before it
   vector<string> extra;     // MYEXTRA and friends, one option per entry
   string myinit;
   bool stopping = false;    // omnium asked it to stop (shutdown, kill_hard): how it ends is no finding
   int exit_status = -1;     // the raw wait status, once alive() has seen it end on its own
+  uintptr_t win_handle = 0;          // MSYS2: a handle to the native server process, opened once it is up (winproc.h)
+  uint32_t win_status = 0;           // its exit status, the NTSTATUS of an exception, once alive() has seen it end on its own
+  bool win_status_known = false;
   void set_paths(const string& trial_root, const string& datadir_override = "");
   Endpoint endpoint() const { return {sock, port, tcp}; }
   vector<string> argv() const;
@@ -452,11 +473,14 @@ struct Instance {
   // cookie check or a __fastfail kills a release server with no banner in the log and no dump; Cygwin reports that
   // death, an NTSTATUS it has no signal for (0xC0000409), as exit status 127.
   bool silent_death() const;
-  string silent_death_uid() const;                              // CRASH_NO_LOG|exit status N
+  // CRASH_NO_LOG|exit code 0xC00000FD with the NTSTATUS of the native process, or CRASH_NO_LOG|exit status N when it could not be read
+  string silent_death_uid() const;
+  string silent_death_note() const;                             // in words: a stack overflow, a failed stack cookie check, ...
 };
 // the start/stop/cl helpers of a saved trial, and the gdb one when it has a core
 void write_helpers(const string& tdir, const Basedir& b, const Instance& inst, const string& myextra, bool core);
 bool root_turned_away(const string& text);                    // a start or backup step that failed because the trial's SQL locked root out: a configured state, no finding
+string silent_death_statement(const string& tdir);            // the last statement of a trial's first thread as its first two words: the per-UID cap keeps each cause of a frameless UID
 bool backup_is_encrypted(const vector<string>& myextra);      // the server ran with the key plugin: its backup is prepared with its own backup-my.cnf
 
 // ---------------------------------------------------------------------------------------------
@@ -706,6 +730,13 @@ bool matrix_builds(const vector<string>& names, vector<Basedir>& out, string* er
 bool matrix_run(const string& sql_file, const vector<Basedir>& builds, const string& options, int slots, MatrixResult& out, string* err);
 string matrix_format(const MatrixResult& m);
 bool row_less(const MatrixRow& a, const MatrixRow& b);           // the row order of the matrix: vendor, version, flavour, dbg first
+bool matrix_row_shows_bug(const MatrixRow& r);                   // a UID, not "No bug found" or "No result (...)"
+// The testcase a report carries. testcase_prettify.sh (mariadb-qa) rewrites the SQL as plain text, and some of what it does changes what
+// the SQL means: a keyword that holds other keywords is half lower-cased (MINUTE_MICROSECOND), a space goes between a function and its "("
+// (NEXTVAL (x), which is no call without IGNORE_SPACE) and into string literals. A testcase it changed can lose the crash, and then the report
+// says no build shows the bug. `m` is the matrix of the prettified testcase; when the build that crashed in the trial (own_path, "" for any
+// build) shows no bug there, run_reduced replays the reduced testcase, and when that shows it `m` becomes that matrix and true comes back.
+bool report_prefer_reduced(MatrixResult& m, const string& own_path, const std::function<bool(MatrixResult&)>& run_reduced);
 
 // ---------------------------------------------------------------------------------------------
 // jira.cpp - Jira REST (libcurl, the PAT ~/jira uses) and the small JSON it needs

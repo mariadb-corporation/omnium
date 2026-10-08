@@ -154,6 +154,7 @@ static void start_from_private_copy(char** argv) {
 }
 
 int main(int argc, char** argv) {
+  fix_msys2_home();
   // a subreducer: the reducer starts copies of its own executable (this binary) with its
   // REDUCER_* variables set and the input file as the only argument
   if (getenv("REDUCER_MULTI_REDUCER") && omnium_reducer_main) return omnium_reducer_main(argc, argv);

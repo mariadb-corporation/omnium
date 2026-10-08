@@ -320,6 +320,20 @@ bool report_to_fields(const string& text, JiraFields& f, string* err) {
   return true;
 }
 
+// whether the build that crashed in the trial (own_path; any build when it is empty) shows a bug in the matrix
+static bool own_build_shows_bug(const MatrixResult& m, const string& own_path) {
+  for (auto& r : m.rows)
+    if (matrix_row_shows_bug(r) && (own_path.empty() || r.b.path == own_path)) return true;
+  return false;
+}
+bool report_prefer_reduced(MatrixResult& m, const string& own_path, const std::function<bool(MatrixResult&)>& run_reduced) {
+  if (own_build_shows_bug(m, own_path)) return false;
+  MatrixResult reduced;
+  if (!run_reduced(reduced) || !own_build_shows_bug(reduced, own_path)) return false;
+  m = reduced;
+  return true;
+}
+
 // the testcase of a saved trial (omnium or pquery-run layout): the deepest reduced file, else the raw trace;
 // the header keeps only the options the bug needs
 bool trial_testcase(const string& workdir, long trial, TrialTestcase& tc, string* err) {
@@ -417,6 +431,7 @@ int cmd_report(const Args& a) {
   write_file(bug_sql, join(sql, "\n") + "\n");
   // the matrix
   MatrixResult m;
+  string prettify_note;                                         // set when the report carries the reduced testcase over the prettified one
   if (!no_matrix) {
     vector<Basedir> set;
     if (!matrix_builds(builds, set, &err)) { fprintf(stderr, "omnium report: %s\n", err.c_str()); return 1; }
@@ -424,8 +439,31 @@ int cmd_report(const Args& a) {
     if (slots <= 0) slots = std::max(1, std::min((int)set.size(), (int)(ram_available_bytes() / (3ull << 30))));
     fprintf(stderr, "matrix: %zu builds, %d at a time\n", set.size(), slots);
     if (!matrix_run(bug_sql, set, "", slots, m, &err)) { fprintf(stderr, "omnium report: matrix: %s\n", err.c_str()); return 1; }
+    // testcase_prettify.sh can change what the SQL means (see report_prefer_reduced), and the reducer saw the reduced testcase crash: when the
+    // trial's own build shows no bug on the prettified one, the reduced one is replayed, and carried when it does
+    if (kTakeFixes && pretty != raw) {
+      vector<string> reduced_lines;
+      for (auto& l : split_lines(raw)) if (!trim(l).empty()) reduced_lines.push_back(l);
+      string reduced_sql = workdir + fmt("/bug%ld.reduced.sql", trial);
+      bool took = report_prefer_reduced(m, have_tb ? tb.path : "", [&](MatrixResult& out) {
+        fprintf(stderr, "matrix: the prettified testcase shows no bug on %s; replaying the reduced one\n", have_tb ? tb.name.c_str() : "any build");
+        write_file(reduced_sql, join(reduced_lines, "\n") + "\n");
+        string e2;
+        return matrix_run(reduced_sql, set, "", slots, out, &e2);
+      });
+      unlink(reduced_sql.c_str());
+      if (took) {
+        string kept = workdir + fmt("/bug%ld.prettified.sql", trial);
+        write_file(kept, join(sql, "\n") + "\n");
+        sql = reduced_lines;
+        write_file(bug_sql, join(sql, "\n") + "\n");
+        prettify_note = "testcase_prettify.sh changed the testcase so that it showed no bug on " + (have_tb ? tb.name : string("any build")) +
+                        "; the report carries the reduced testcase as the reducer left it (the prettified one is " + kept + ")";
+        fprintf(stderr, "matrix: the reduced testcase shows the bug, and goes into the report\n");
+      }
+    }
   }
-  auto shows_bug = [](const MatrixRow& r) { return r.uid != "No bug found" && !starts_with(r.uid, "No result"); };
+  auto shows_bug = [](const MatrixRow& r) { return matrix_row_shows_bug(r); };
   // the build whose blocks go in: the trial's own when it shows the bug, else a dbg build, else any
   const MatrixRow* lead = nullptr;
   for (auto& r : m.rows) if (have_tb && r.b.path == tb.path && shows_bug(r) && r.b.flavour == Flavour::Plain) lead = &r;
@@ -544,6 +582,7 @@ int cmd_report(const Args& a) {
   // the notes the reader needs before the .ok
   vector<string> notes;
   if (!reduced) notes.push_back("the testcase is the raw trace, not a reduced one");
+  if (!prettify_note.empty()) notes.push_back(prettify_note);
   if (!m.rows.empty() && !lead && san_rows.empty()) notes.push_back("no build in the matrix showed the bug; the stack is the trial's own");
   if (have_tb && !m.rows.empty()) { bool own = false; for (auto& r : m.rows) if (r.b.path == tb.path && shows_bug(r)) own = true; if (!own) notes.push_back("the trial's own build did not show the bug on this replay"); }
   if (no_mtr) notes.push_back("MTR testcase: skipped (--no-mtr); the report carries the SQL testcase alone");

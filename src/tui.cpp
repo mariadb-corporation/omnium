@@ -4,6 +4,7 @@
 // a stop through <workdir>/omnium.ctl, so the view never touches the run's own state. Not a
 // terminal, or TUI=0: the log is followed instead.
 #include "verbs.h"
+#include "winterm.h"
 #include <termios.h>
 #include <sys/ioctl.h>
 #include <signal.h>
@@ -42,7 +43,12 @@ struct Term {
 void term_size(int& rows, int& cols) {
   struct winsize w{};
   rows = 40; cols = 120;
-  if (ioctl(1, TIOCGWINSZ, &w) == 0 && w.ws_row > 0) { rows = w.ws_row; cols = w.ws_col; }
+  if (ioctl(1, TIOCGWINSZ, &w) == 0 && w.ws_row > 0) {
+    rows = w.ws_row;
+    cols = w.ws_col;
+    // the rows under the taskbar, or off the screen's edge, are the terminal's but nobody's to see
+    rows = std::min(rows, std::max(12, rows - term_rows_hidden(rows)));
+  }
 }
 string clip(const string& s, size_t w) {
   if (s.size() <= w) return s;

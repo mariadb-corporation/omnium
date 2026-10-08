@@ -63,6 +63,12 @@ the Windows profile, `C:\Users\<you>`, which MSYS2 names `/c/Users/<you>`. Only 
 replaced that way: a `HOME` set to anything else is the home, which is how the selftest keeps the
 omniums it starts away from the real token. `PAT_FILE` names another file.
 
+A Windows shell can hand omnium `HOME` as the profile (`/c/Users/<you>`), as Git Bash does: omnium would
+then write `.omnium.conf` and `.bashrc` there, beside the real ones, and stop at the defaults ("INFILE not
+found"). A `HOME` that is the profile, has no `.omnium.conf`, while the MSYS2 home has one, is taken for that
+mistake: omnium uses the MSYS2 home and says so. Any other `HOME` is the home, which is how the selftest
+keeps the omniums it starts away from the real files.
+
 A Windows file is protected by its ACL, which `umask` does not set, and MSYS2 mounts ignore ACLs,
 so `ls -l` shows 644 whatever the ACL says. When it finds no token, `omnium init` prints the line
 that keeps the file to one account:
@@ -100,6 +106,40 @@ the server as `/dev/shm/...` and is looked for on the wrong drive (the `innodb-e
 saved trial therefore turn the path of such an option into `C:/msys64/dev/shm/...`
 (`native_option` in `util.cpp`).
 
+## The server's port
+
+A Windows server is found by its port and nothing else, so the port has to be the server's own. A trial
+once ran its SQL on another trial's server and was saved as `CRASH_NO_LOG|exit code 0x00000001`, a crash
+of a server that had never started. Three things were behind it, and each has its own fix.
+
+**The pick.** `port_pick()` probes with a `bind()` on `127.0.0.1`, and under MSYS2 that bind succeeds for a
+port that a server listens on and for the source port of an open connection. mysqld binds the dual-stack
+wildcard `::` and sets no `SO_REUSEADDR` (it leaves it off on Windows, where it would let a second server
+take a port over), and that is the bind both of those refuse. On MSYS2 the probe is that bind now
+(`port_free`), and the pick is in 13001-49151: Windows hands its clients the ports from 49152 up
+(`netsh int ipv4 show dynamicport tcp`), and the connections of a run take them at any moment, so a
+server that picked one there could lose it to a client before it got to bind. Linux keeps its probe and its range.
+
+**The readiness probe.** A server that loses its port dies at the bind about two seconds into its start:
+`Can't start server: Bind on TCP/IP port. Got error: 10048: Only one usage of each socket address ... is
+normally permitted`, `Do you already have another server running on port`, `Aborting`, exit code 1, and no
+pid file (MariaDB 10.11 and 13.1 alike). A probe that connects to the port in those two seconds reaches
+whoever holds it, and `root` has no password. `wait_ready` therefore connects to a TCP server only once its
+own log, from where this start began, says `ready for connections`, which a bind that failed never prints
+(`Instance::log_from`: a restart on the same datadir appends to the log of the first start, and that start's
+line is not this one's). MariaDB prints it under `--silent-startup` and `--log-warnings=0` as well. A log that
+never says it is trusted after 20 s, and the server that answers then has to report this trial's datadir
+(`SELECT @@datadir`, compared with `same_path`, which ignores slashes, case and a slash at the end). The probe also stops touching the other server: it
+used to run `CREATE DATABASE IF NOT EXISTS test` on whichever one answered.
+
+**The outcome.** A start whose log has the bind failure is dropped as `port-clash` (the ledger line says
+which port), as a Linux "Address already in use" always was, and is no start failure and no silent death. On
+the restart of a crash-recovery trial the same failure drops the trial instead of filing it as
+`CRASH_RECOVERY_ISSUE`, and the server on the restored data of a backup round trip tries another port, up
+to twice, instead of filing a `BACKUP_ISSUE`. Both of those are `kTakeFixes`: a Linux box keeps what it did
+until it is decided. The trial is dropped, not run again: its SQL was made from its seed and names its
+port (the FederatedX `CREATE SERVER`), and a second port would give a trial that its seed no longer replays.
+
 ## The datadir template
 
 `mariadb-install-db.exe` has its own option set. omnium calls it with `--datadir=` alone, plus
@@ -120,6 +160,16 @@ MSYS2 has no tmpfs: `SHM_DIR` (`/dev/shm`) is a plain folder of the MSYS2 instal
 so the trials run on disk and `SHM_CAP_PCT`, `SHM_PAUSE_PCT` and `SHM_STEPDOWN_PCT` measure that
 disk's use, not RAM's. `omnium init` says so rather than printing the disk's size as RAM. `SHM_DIR=`
 can name a folder on a RAM disk to get the Linux behaviour.
+
+## The live view
+
+`omnium tui` draws down to the last line but one of the terminal. A window can be dragged taller
+than the screen, and its terminal still reports every row, so on Windows the view measures the
+window against the work area of its monitor (the screen less the taskbar) and leaves the rows
+below that empty. It finds the window of the mintty it runs under, of a console, or of Windows
+Terminal, and measures again on every frame, so moving or resizing the window needs no restart.
+Where there is no window to ask (a terminal that is no window of this desktop, a minimized
+window) every row is used.
 
 ## Child processes
 
@@ -149,6 +199,12 @@ minutes old; opening a running exe for writing fails with "Device or resource bu
 is told. A process started before this existed, or from `omnium.exe` by any other verb, still depends on
 the file: **`build.sh` therefore never replaces an `omnium.exe` that is in use.** It waits ten seconds for
 it, and then leaves the build as `omnium.exe.new` and says so.
+
+Windows also refuses to rename a folder that holds a file another process has open, or a rename onto a
+file another thread is just replacing. The folder of a crashed trial is one case, while its minidump is
+still being written or scanned (`save-failed ... Permission denied`); a status file written by two
+threads is another. `move_tree` therefore tries again for up to 30 s and `write_file` for 2 s. A trial
+that still cannot be saved stays where it is, with a `SAVE_FAILED` file, and the ledger line says why.
 
 The all-disk SQL set (`ALL_DISK_SQL=1`) is not `find /` here: `/` is the MSYS2 install, and its
 `/proc/registry` is the Windows registry as folders, which `find` walks for minutes. The scan
@@ -226,12 +282,44 @@ mariadb.exe, mysql.exe) is done once, as the error-log lines are read, so every 
 line as its Linux twin. `omnium parity` gives the scripts a copy of a Windows log with mariadbd.exe
 and mysqld.exe stripped, as the port reads it, so the two chains compare the same text.
 
+A Windows server can also die with nothing in its log and no dump: a failed /GS stack cookie check or a
+`__fastfail` (0xC0000409), or an exhausted stack that leaves the crash handler no stack to run on, which
+the server reports as an access violation (0xC0000005). The Cygwin runtime reports that to the parent as
+signal 11 or as exit status 127, whatever the NTSTATUS was, so omnium keeps a handle to the native server
+process once it is up (`winproc.cpp`, through `/proc/<pid>/winpid`) and reads the exit status from it. The
+UID of such a death is `CRASH_NO_LOG|exit code 0xC0000409`, in the matrix and in trials (`SILENT_DEATH`
+in the trial says it in words); `CRASH_NO_LOG|exit status N` when the status could not be read. It has no
+frames, so it cannot equal the Linux UID of the same bug (a stack overflow in the optimizer is
+`SIGSEGV|create_view_field|...` on Linux): a Windows death of this kind is looked up as its own class. It
+is also shared by every cause that kills a server this way, so the cap of `KEEP_PER_UID` trials counts a
+cause once: a `DUP_KEY` file in the trial holds the UID and the first two words of the last statement of
+the first thread (`DROP TABLE`, `WITH RECURSIVE`), and the cap counts trials with the same key. The UID
+itself, and the known-bugs match, stay as they are.
+
 A crash leaves `mariadbd.dmp` in the datadir, and that dump is what a core is to a trial
 (`Instance::has_dump`): the trial takes the crash UID from the frames in the log even when the
 error-log scan flagged another line as well, as a core wins on Linux. Before that a trial whose log had
 both was saved with the flagged line's UID (`SLAVE_ERROR|...`) in `MYBUG`, and the crash was filed as
 noise. A flagged line with no crash gets the UID `omnium t` gives it (the same function), so `MYBUG`
 and `omnium t` agree; the scan's own pick stays when the chain has none.
+
+## The testcase of a report
+
+`omnium report` runs the reduced testcase through `testcase_prettify.sh` (mariadb-qa) and replays the
+prettified file in the matrix. The prettifier is a chain of `sed` substitutions over the text, and some of
+them change what the SQL means: a keyword that holds other keywords is half lower-cased
+(`MINUTE_MICROSECOND` becomes `minute_microSECOND`, which is no SQL), a space is put between a function and
+its `(` (`NEXTVAL (cs2)`, `percentile_disc (c1)`: without `IGNORE_SPACE` that is not a call), and spaces go
+inside string literals (`'...#"(~"...'` becomes `#" (~"`, which changes the data). A crash can go with
+that: trial 5214 crashed four times in four on the reduced file and never on its prettified `bug5214.sql`,
+and the report said no build showed the bug and gave the MTR test no gate.
+
+The reducer saw the reduced file crash, so when the trial's own build shows no bug on the prettified file
+the report replays the reduced file in the matrix too, and carries it when it does: `bug<N>.sql` is then
+the reduced file, `bug<N>.prettified.sql` the prettified one, the matrix, the MTR test and the SQL block are
+the reduced file's, and a note says why. Nothing else changes when the prettified file shows the bug. The
+fix is `kTakeFixes`, so a Linux box keeps the prettified file until it is decided: its prettifier is the same
+script. The script's own faults are for the mariadb-qa side to fix, and omnium does not edit that checkout.
 
 ## What does not carry over
 
@@ -268,6 +356,13 @@ summary as skipped:
 - The shell scan on a log line with a byte the locale cannot read: the grep 3.0 of MSYS2 prints its
   note on stdout, so the script answers `UNTYPED` where the check describes grep 3.5 and later.
 - A stopped run picked up again, on a box with no build under `TEST_DIR`.
+
+`omnium selftest --deep` adds the checks that need a real server, and takes an hour on Windows (the UID
+parity phase alone is half of it, and silent). Its "fresh" step also stops and wipes the fresh server of
+the build it uses, `/dev/shm/Ofresh_13.1-opt`, a directory shared with whoever runs `omnium fresh` for that
+build. `omnium selftest --deep-ports` is the one real-server check of [the server's port](#the-servers-port),
+a second server started on the port of a first, and nothing else of it: a few minutes (most of it the
+datadir template), and it stays inside its own temp dir.
 
 The Jira checks talk to a stand-in Jira that takes any token, so they run with a stand-in one on
 every box and the real token never leaves its file. A box without a token gets a "Jira PAT missing"
